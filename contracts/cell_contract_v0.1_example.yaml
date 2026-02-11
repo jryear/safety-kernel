@@ -1,0 +1,78 @@
+schema_version: "0.1.0"
+
+metadata:
+  contract_id: "c8c7c2f0-7a0a-4d7e-9a3c-2f6c6f5c2c1a"
+  cell_id: "cell_demo_01"
+  created_at: "2026-02-06T00:00:00Z"
+  created_by: "integrator:acme_automation"
+  description: "Demo cell contract: primitives + anchors + monitors + revocation policy"
+  robot_compat:
+    robot_model: ["ur10e"]
+    tool_flange: "ISO_9409_1_50_4_M6"
+    payload_class_kg: [0.0, 5.0]
+  validity:
+    valid_from: "2026-02-06T00:00:00Z"
+    expires_at: null
+
+frames:
+  units: {length: "m", angle: "rad"}
+  cell_frame:
+    name: "cell"
+    convention: "right_handed"
+  robot_base_in_cell:
+    xyz: [1.20, 0.35, 0.00]
+    rpy: [0.00, 0.00, 1.57079632679]
+    tolerance:
+      pos_m: 0.005
+      rot_rad: 0.01
+
+geometry:
+  keepouts:
+    - name: "fence_north"
+      type: "box"
+      pose_in_cell: {xyz: [0.0, 1.20, 0.90], rpy: [0.0, 0.0, 0.0]}
+      dims: {x: 3.0, y: 0.05, z: 1.8}
+      tolerance: {inflate_m: 0.02}
+      enforcement:
+        hard_keepout: true
+
+  allowed_regions:
+    - name: "work_envelope"
+      type: "box"
+      pose_in_cell: {xyz: [0.70, 0.40, 0.85], rpy: [0.0, 0.0, 0.0]}
+      dims: {x: 1.40, y: 1.20, z: 1.70}
+      tolerance: {deflate_m: 0.02}
+
+anchors:
+  - name: "tag_A"
+    type: "fiducial"
+    sensor: "camera_front"
+    expected_pose_in_cell: {xyz: [0.20, 0.10, 1.00], rpy: [0.0, 0.0, 0.0]}
+    tolerance: {pos_m: 0.01, rot_rad: 0.03}
+    required: true
+
+assumption_monitors:
+  - name: "anchors_consistent"
+    type: "anchor_pose_consistency"
+    params:
+      anchors: ["tag_A"]
+      aggregation: "any_required_out_of_tolerance"
+    severity: "revoke"
+
+  - name: "estop_chain_ok"
+    type: "safety_io_health"
+    params:
+      signal: "estop_ok"
+      expected: true
+    severity: "rta_stop"
+
+revocation_policy:
+  on_revoke:
+    l0c_enabled: false
+    l1_mode: "full_conservative"
+  on_rta_stop:
+    sequence: ["controlled_stop", "retreat_to_home", "operator_handoff"]
+
+integrity:
+  body_sha256: "TBD_AFTER_CANONICALIZATION"
+  signer_id: "integrator:acme_automation"

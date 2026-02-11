@@ -1,0 +1,149 @@
+schema_version: "0.1.0"
+
+metadata:
+  contract_id: "cell-arm-track-a-001"
+  cell_id: "cell_arm_sim_01"
+  created_at: "2026-02-11T00:00:00Z"
+  created_by: "integrator:safety_kernel_dev"
+  description: "Track A contract for CellArm 5-DOF simulation environment"
+  robot_compat:
+    robot_model: ["cell_arm_5dof"]
+  validity:
+    valid_from: "2026-02-11T00:00:00Z"
+    expires_at: null
+
+frames:
+  units: {length: "m", angle: "rad"}
+  cell_frame:
+    name: "cell"
+    convention: "right_handed"
+  robot_base_in_cell:
+    xyz: [0.0, 0.0, 0.0]
+    rpy: [0.0, 0.0, 0.0]
+    tolerance:
+      pos_m: 0.005
+      rot_rad: 0.01
+
+geometry:
+  keepouts:
+    - name: "fixture_column"
+      type: "box"
+      pose_in_cell: {xyz: [0.6, 0.35, 0.3], rpy: [0.0, 0.0, 0.0]}
+      dims: {x: 0.2, y: 0.2, z: 0.6}
+      tolerance: {inflate_m: 0.02}
+      enforcement:
+        hard_keepout: true
+
+    - name: "back_wall"
+      type: "box"
+      pose_in_cell: {xyz: [-0.3, 0.0, 0.5], rpy: [0.0, 0.0, 0.0]}
+      dims: {x: 0.1, y: 0.8, z: 1.0}
+      tolerance: {inflate_m: 0.02}
+      enforcement:
+        hard_keepout: true
+
+  allowed_regions:
+    - name: "work_envelope"
+      type: "box"
+      pose_in_cell: {xyz: [0.4, 0.0, 0.5], rpy: [0.0, 0.0, 0.0]}
+      dims: {x: 0.8, y: 0.8, z: 1.0}
+      tolerance: {deflate_m: 0.02}
+      enforcement:
+        hard_keepout: false
+        caps_when_active:
+          max_tcp_speed_mps: 0.6
+
+anchors:
+  - name: "fiducial_fixture"
+    type: "fiducial"
+    sensor: "camera_front"
+    expected_pose_in_cell: {xyz: [0.6, 0.25, 0.6], rpy: [0.0, 0.0, 0.0]}
+    tolerance: {pos_m: 0.01, rot_rad: 0.03}
+    required: true
+
+  - name: "fiducial_wall"
+    type: "fiducial"
+    sensor: "camera_front"
+    expected_pose_in_cell: {xyz: [-0.25, 0.0, 0.8], rpy: [0.0, 0.0, 0.0]}
+    tolerance: {pos_m: 0.01, rot_rad: 0.03}
+    required: true
+
+assumption_monitors:
+  - name: "anchors_consistent"
+    type: "anchor_pose_consistency"
+    inputs: ["camera_front"]
+    params:
+      anchors: ["fiducial_fixture", "fiducial_wall"]
+      aggregation: "any_required_out_of_tolerance"
+    debounce_ms: 250
+    hysteresis_ms: 500
+    severity: "revoke"
+    action: "revoke_L0C_enable_L1_full"
+
+  - name: "gate_interlock_ok"
+    type: "safety_io_health"
+    inputs: ["safety_plc"]
+    params:
+      signal: "gate_closed"
+      expected: true
+    debounce_ms: 0
+    hysteresis_ms: 0
+    severity: "rta_stop"
+    action: "safe_stop"
+
+  - name: "estop_chain_ok"
+    type: "safety_io_health"
+    inputs: ["safety_plc"]
+    params:
+      signal: "estop_ok"
+      expected: true
+    debounce_ms: 0
+    hysteresis_ms: 0
+    severity: "rta_stop"
+    action: "safe_stop"
+
+  - name: "front_cam_health"
+    type: "sensor_health"
+    inputs: ["camera_front"]
+    params:
+      max_frame_age_ms: 100
+      monotonic_timestamps: true
+      calibration_checksum: "SIM_PLACEHOLDER"
+    debounce_ms: 500
+    hysteresis_ms: 1000
+    severity: "degrade"
+    action: "tighten_caps"
+
+  - name: "robot_mount_integrity"
+    type: "robot_mount_integrity"
+    inputs: ["robot_proprioception"]
+    params:
+      base_pose_drift_pos_m: 0.005
+      base_pose_drift_rot_rad: 0.01
+    debounce_ms: 250
+    hysteresis_ms: 500
+    severity: "revoke"
+    action: "revoke_L0C_enable_L1_full"
+
+revocation_policy:
+  on_degrade:
+    l0c_still_enforced: true
+    caps:
+      max_tcp_speed_mps: 0.20
+      restrict_to_allowed_regions: true
+  on_revoke:
+    l0c_enabled: false
+    l1_mode: "full_conservative"
+  on_rta_stop:
+    sequence: ["controlled_stop", "retreat_to_home", "operator_handoff"]
+
+integrity:
+  canonicalization:
+    sort_keys: true
+    float_quantization: 1.0e-6
+    normalize_newlines: true
+    unit_normalization: true
+  body_sha256: "TBD_AFTER_CANONICALIZATION"
+  signature: null
+  signer_id: "integrator:safety_kernel_dev"
+  signed_at: null

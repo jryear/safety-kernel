@@ -1,0 +1,65 @@
+run_id: "run_YYYYMMDD_NNN"
+seed: 42
+track: "A"
+env: "cell_arm_5dof"
+loop_rate_hz: 50
+horizon_H_steps: 15
+
+contract:
+  contract_id: "cell-arm-track-a-001"
+  contract_body_sha256: "..."
+  contract_file: "contracts/cell_arm_track_a.yaml"
+
+l0r:
+  e_max_j: 5.0
+  energy_margin: 0.98
+  eps_q_rad: 0.001
+  eps_qdot_radps: 0.01
+  d_safe_m: 0.02
+
+l2:
+  controller: "pd_reaching"
+  k_p: 2.0
+  goal_hold_steps: 50
+  goal_tolerance_m: 0.05
+
+models:
+  critic_arch: "shared_trunk_dual_head"
+  ensemble_size: 3
+  checkpoint_sha256: "..."
+
+l1_enforcement:
+  arm: "none"
+  critic_config:
+    ucb_k: 2.0
+    threshold_enforcement: "hard"
+  barrier_qp_config:
+    solver: "osqp"
+    solver_time_budget_ms: 5.0
+    barrier_type: "learned"
+    cbf_class: 1
+    relaxation: "soft_constraint"
+    relaxation_penalty: 1000.0
+
+calibration:
+  target_fn_alpha: 0.01
+  epsilon_percentiles:
+    obstacle_distance: [1, 3, 5, 10, 15]
+    joint_margin: [1, 3, 5, 10, 15]
+    energy_margin: [1, 3, 5, 10, 15]
+  conformal_variant: "online"
+  cold_start:
+    n_warmup_episodes: 200
+    coverage_tolerance: 0.005
+    initial_tau: "+inf"
+
+proprioceptive_noise:
+  enabled: false
+  sigma_joint_pos_rad: 0.001
+  sigma_joint_vel_radps: 0.01
+  sigma_torque_nm: 0.5
+
+logging:
+  ndjson_path: "events.ndjson"
+  hash_chain: "sha256_prev_hash"
+  episode_crc32: true

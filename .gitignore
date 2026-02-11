@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+
+# pyenv
+.python-version
+
+# Data artifacts
+*.ndjson
+*.ndjson.gz
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# MuJoCo artifacts
+*.mjlog
+
+# Experiment outputs
+sessions/
+runs/
