@@ -19,7 +19,7 @@ l0r:
 
 l2:
   controller: "pd_reaching"
-  k_p: 2.0
+  k_p: 0.5
   goal_hold_steps: 50
   goal_tolerance_m: 0.05
 

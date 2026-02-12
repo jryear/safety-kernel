@@ -1,0 +1,153 @@
+<mujoco model="cell_arm_5dof">
+  <compiler angle="radian" autolimits="true"/>
+
+  <option timestep="0.02" gravity="0 0 -9.81" integrator="Euler"/>
+
+  <default>
+    <joint damping="0.5" armature="0.01"/>
+    <geom contype="1" conaffinity="1" friction="1.0 0.005 0.001"/>
+    <default class="visual">
+      <geom contype="0" conaffinity="0" group="1" rgba="0.7 0.7 0.7 1"/>
+    </default>
+  </default>
+
+  <asset>
+    <material name="mat_link" rgba="0.6 0.6 0.65 1"/>
+    <material name="mat_ee" rgba="0.3 0.6 0.3 1"/>
+    <material name="mat_keepout" rgba="0.8 0.2 0.2 0.3"/>
+    <material name="mat_ground" rgba="0.4 0.4 0.4 1"/>
+  </asset>
+
+  <worldbody>
+    <!-- Ground plane -->
+    <geom name="ground" type="plane" size="2 2 0.01" material="mat_ground"
+          contype="0" conaffinity="0"/>
+
+    <!-- ============================================ -->
+    <!-- Robot arm: base at origin, Z-Y-Z-Y-Z joints  -->
+    <!-- ============================================ -->
+
+    <!-- Link 0: base (fixed mount) -->
+    <body name="link_0" pos="0 0 0">
+      <geom name="geom_link_0" type="capsule" fromto="0 0 0  0 0 0.15"
+            size="0.06" rgba="0.5 0.5 0.55 1"
+            contype="1" conaffinity="1" mass="0"/>
+
+      <!-- Joint 1: base yaw (Z-axis) -->
+      <body name="link_1" pos="0 0 0.15">
+        <joint name="joint_1" type="hinge" axis="0 0 1"
+               range="-3.14159265 3.14159265"/>
+        <geom name="geom_link_1" type="capsule" fromto="0 0 0  0 0 0.30"
+              size="0.05" material="mat_link"
+              contype="2" conaffinity="2" mass="4.0"/>
+
+        <!-- Joint 2: shoulder pitch (Y-axis) -->
+        <body name="link_2" pos="0 0 0.30">
+          <joint name="joint_2" type="hinge" axis="0 1 0"
+                 range="-3.14159265 3.14159265"/>
+          <geom name="geom_link_2" type="capsule" fromto="0 0 0  0.25 0 0"
+                size="0.045" material="mat_link"
+                contype="4" conaffinity="4" mass="3.0"/>
+
+          <!-- Joint 3: elbow yaw (Z-axis) -->
+          <body name="link_3" pos="0.25 0 0">
+            <joint name="joint_3" type="hinge" axis="0 0 1"
+                   range="-3.14159265 3.14159265"/>
+            <geom name="geom_link_3" type="capsule" fromto="0 0 0  0.20 0 0"
+                  size="0.04" material="mat_link"
+                  contype="8" conaffinity="8" mass="2.0"/>
+
+            <!-- Joint 4: wrist pitch (Y-axis) -->
+            <body name="link_4" pos="0.20 0 0">
+              <joint name="joint_4" type="hinge" axis="0 1 0"
+                     range="-3.14159265 3.14159265"/>
+              <geom name="geom_link_4" type="capsule" fromto="0 0 0  0.15 0 0"
+                    size="0.035" material="mat_link"
+                    contype="16" conaffinity="16" mass="1.5"/>
+
+              <!-- Joint 5: wrist roll (Z-axis) -->
+              <body name="link_5" pos="0.15 0 0">
+                <joint name="joint_5" type="hinge" axis="0 0 1"
+                       range="-3.14159265 3.14159265"/>
+                <geom name="geom_link_5" type="capsule" fromto="0 0 0  0.10 0 0"
+                      size="0.03" material="mat_ee"
+                      contype="32" conaffinity="32" mass="1.0"/>
+                <!-- TCP site at end of end-effector -->
+                <site name="tcp" pos="0.10 0 0" size="0.01"/>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- ============================================ -->
+    <!-- Cell geometry (visualization + ground truth) -->
+    <!-- ============================================ -->
+
+    <!-- Keepout 1: fixture column -->
+    <body name="keepout_fixture_column" pos="0.6 0.35 0.3">
+      <geom name="geom_keepout_fixture" type="box" size="0.1 0.1 0.3"
+            material="mat_keepout" contype="0" conaffinity="0"/>
+    </body>
+
+    <!-- Keepout 2: back wall -->
+    <body name="keepout_back_wall" pos="-0.3 0.0 0.5">
+      <geom name="geom_keepout_wall" type="box" size="0.05 0.4 0.5"
+            material="mat_keepout" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <!-- Velocity servo actuators with torque limits -->
+  <actuator>
+    <velocity name="act_joint_1" joint="joint_1"
+              ctrlrange="-3.14159265 3.14159265" forcerange="-50 50"
+              kv="50"/>
+    <velocity name="act_joint_2" joint="joint_2"
+              ctrlrange="-3.14159265 3.14159265" forcerange="-50 50"
+              kv="50"/>
+    <velocity name="act_joint_3" joint="joint_3"
+              ctrlrange="-3.14159265 3.14159265" forcerange="-30 30"
+              kv="30"/>
+    <velocity name="act_joint_4" joint="joint_4"
+              ctrlrange="-3.14159265 3.14159265" forcerange="-15 15"
+              kv="15"/>
+    <velocity name="act_joint_5" joint="joint_5"
+              ctrlrange="-3.14159265 3.14159265" forcerange="-10 10"
+              kv="10"/>
+  </actuator>
+
+  <!-- Self-collision: use contype/conaffinity bitmasks.
+       Adjacent links use non-overlapping bits to exclude collision.
+       Non-adjacent active pairs share bits to enable collision detection.
+
+       link_0: contype=1   (bit 0)
+       link_1: contype=2   (bit 1)
+       link_2: contype=4   (bit 2)
+       link_3: contype=8   (bit 3)
+       link_4: contype=16  (bit 4)
+       link_5: contype=32  (bit 5)
+
+       Active collision pairs (non-adjacent):
+       (link_0, link_3): bits 0 & 3
+       (link_0, link_4): bits 0 & 4
+       (link_0, link_5): bits 0 & 5
+       (link_1, link_4): bits 1 & 4
+       (link_1, link_5): bits 1 & 5
+
+       MuJoCo collision detection: geom A collides with geom B if
+       (contype_A & conaffinity_B) || (contype_B & conaffinity_A) is nonzero.
+       With contype == conaffinity per geom, adjacent links (no shared bits)
+       won't collide, while non-adjacent links will need explicit contact
+       pair definitions since their bits also don't overlap.
+  -->
+
+  <!-- Explicit contact pairs for non-adjacent links we want to monitor -->
+  <contact>
+    <pair geom1="geom_link_0" geom2="geom_link_3" margin="0.02"/>
+    <pair geom1="geom_link_0" geom2="geom_link_4" margin="0.02"/>
+    <pair geom1="geom_link_0" geom2="geom_link_5" margin="0.02"/>
+    <pair geom1="geom_link_1" geom2="geom_link_4" margin="0.02"/>
+    <pair geom1="geom_link_1" geom2="geom_link_5" margin="0.02"/>
+  </contact>
+</mujoco>
