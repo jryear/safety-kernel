@@ -74,5 +74,5 @@ revocation_policy:
     sequence: ["controlled_stop", "retreat_to_home", "operator_handoff"]
 
 integrity:
-  body_sha256: "TBD_AFTER_CANONICALIZATION"
+  body_sha256: "7a7836215c59cf1ea5a03569a72d34296b7401f16d8bb4ee66a1170e0a5ab50e"
   signer_id: "integrator:acme_automation"

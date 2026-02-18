@@ -47,6 +47,11 @@ Prove in simulation that a **failure‑first** safety architecture is:
 - hard projection on the *current* believed state set (no rollout, no prediction)
 - deterministic, < 1ms target
 
+**Predictive shield guard (compile-time):**
+- `ENABLE_PREDICTIVE_SHIELD = false` until Gate 6 calibration governance is online
+- Predictive shields (barrier certificates, CBF-QP) are diagnostic-only while this flag is false
+- Rationale: integration error between kernel prediction and plant realization is not additive state uncertainty — treating it as such (Path 2) contaminates erosion budgets. The kernel is safe because it re-projects from actual state every tick. Predictive enforcement requires calibrated error models (Gate 6+).
+
 #### 2.1.1 L0-R Projection Algorithm (CellArm)
 
 **Action/observation model:**
@@ -355,6 +360,13 @@ All must hold:
 - Tolerance: floating-point ε = 1e-8 (smaller than sensor erosion by orders of magnitude)
 - This checks **kernel outputs** (`qdot_exec`), not plant realized state — the kernel is responsible for what it commands, not for MuJoCo integration drift
 - **Plant tracking diagnostic** (logged, not a gate blocker): additionally log `truth.q`, `truth.qdot`, `truth.E_k` violations as a diagnostic metric quantifying plant-integrator gap. Non-zero values are expected and informative but do not fail the gate.
+
+**(a.gate4) Plant fidelity criterion (Gate 4+ only):**
+- With `nsubsteps ≥ 10` active (see Appendix D.11), per-joint p99 tracking errors must fall below the within-tick margin budget:
+  - `p99(|q_realized - q_predicted|) < eps_q` (joint position)
+  - `p99(|qdot_realized - qdot_predicted|) < eps_qdot` (joint velocity)
+- Exact thresholds TBD at Gate 4 based on empirical measurement with nsubsteps active
+- This criterion validates that the simulated plant resembles a servo system (tracking the commanded velocity closely enough that within-tick prediction is meaningful)
 
 **(b) Detection SLA:**
 - Per monitor type: when a shift is injected that violates the monitor's predicate, the state machine must transition within `debounce_ms + 1 control tick` of the first violation
@@ -669,24 +681,28 @@ logging:
 
 # Appendix C — NDJSON Event Schemas (full field definitions)
 
-Four event types, one per line in the NDJSON log. All events share the `prev_hash` chain for integrity.
+Seven event types, one per line in the NDJSON log. All events share the `prev_hash` chain for integrity. Every event carries `event_type` as the first field for dispatch.
 
 ## C.1 `safety_intervention`
 
+Emitted when a safety layer **actually modifies** the command (not on pass-through). Use `layer` to disambiguate which layer intervened. L0-C emits only when `scaling_factor < 1.0`. L0-R emits when `constraints_active` is non-empty. Layer-specific fields go in `layer_info` to keep the top-level schema stable across layers.
+
 ```
-timestamp_ns          int64    simulated wall-clock (episode_start_ns + step * dt_ns)
+event_type            string   "safety_intervention"
+timestamp_ns          int64    simulated wall-clock: int(data.time * 1e9)
 episode_id            string
 step                  int
 layer                 enum     "L0R" | "L0C" | "L1"
 prev_hash             string   SHA256 hex of previous event's canonical JSON bytes
-qdot_cmd              float[5] L2's proposed velocity command
-qdot_exec             float[5] post-projection executed velocity command
+qdot_cmd              float[5] input to this layer (L2 output for L0C, L0C output for L0R)
+qdot_exec             float[5] output of this layer
 constraints_active    list[string]  names of constraints that modified qdot_cmd
-margin_to_L0R         dict     per-constraint minimum margin (float)
-energy_ratio          float    E_k / E_max (where E_max is from run manifest)
-energy_scaling_factor float    1.0 if no scaling applied
-collision_pairs       list[{pair_id: string, distance: float}]  all active pairs, not just min
-rta_nearmiss          bool     true if infeasibility triggered recovery velocity
+margin_to_L0R         dict     per-constraint minimum margin (float) — L0R only, {} for L0C
+energy_ratio          float    E_k / E_max — L0R only, 0.0 for L0C
+energy_scaling_factor float    1.0 if no scaling applied — L0R only
+collision_pairs       list[{pair_id: string, distance: float}]  L0R only, [] for L0C
+rta_nearmiss          bool     true if infeasibility triggered recovery velocity — L0R only
+layer_info            dict     layer-specific fields (see below)
 truth                 object   {q: float[5], qdot: float[5], tau: float[5],
                                tcp_to_keepout_distances: dict[string, float],
                                self_collision_surface_distances: dict[string, float]}
@@ -694,35 +710,47 @@ observed              object   {q: float[5], qdot: float[5], tau: float[5]}
 believed              object   {q_interval: float[5][2], qdot_interval: float[5][2]}
 ```
 
+**layer_info for L0C:**
+```
+tcp_speed_before      float    ||J(q) @ qdot_cmd|| before clamping
+tcp_speed_after       float    ||J(q) @ qdot_exec|| after clamping
+scaling_factor        float    v_max / speed (< 1.0 when emitted)
+```
+
+**layer_info for L0R:** `{}` (all L0R-specific fields are top-level)
+
 ## C.2 `contract_state_change`
 
 ```
+event_type            string   "contract_state_change"
 timestamp_ns          int64
 episode_id            string
 step                  int
 prev_hash             string
 from_state            enum     "ACTIVE" | "DEGRADED" | "REVOKED" | "RTA_STOP"
 to_state              enum     "ACTIVE" | "DEGRADED" | "REVOKED" | "RTA_STOP"
-trigger_monitor       string   monitor name or "l0r_nearmiss" or "operator_reset"
+trigger_monitor       string   monitor name, "l0r_nearmiss", "operator_reset", or "flap_limiter"
 trigger_severity      enum     "degrade" | "revoke" | "rta_stop" | "clear" | "reset"
-monitors_status       dict     per-monitor pass/fail snapshot at transition time
+monitors_status       dict     {monitor_name: {"triggered": bool, "violated": bool}}
 ```
 
 ## C.3 `shift_injected`
 
 ```
+event_type            string   "shift_injected"
 timestamp_ns          int64
 episode_id            string
 step                  int     (or -1 for episode-level shifts)
 prev_hash             string
-shift_type            string   e.g. "geometry_drift", "sensor_degradation", "proprioceptive_noise"
+shift_type            string   "anchor_drift" | "safety_io_flip" | "sensor_stale" | "base_drift"
 shift_params          dict     type-specific parameters
-affected_channels     list[string]  e.g. ["observed.q", "observed.qdot"]
+affected_channels     list[string]  e.g. ["anchor_poses", "safety_io", "sensor_health", "base_pose_estimate"]
 ```
 
 ## C.4 `episode_summary`
 
 ```
+event_type            string   "episode_summary"
 episode_id            string
 seed                  int
 contract_hash         string
@@ -742,27 +770,77 @@ fp_count              int      (if calibration active, else 0)
 episode_crc32         string   CRC32 of all events in this episode
 ```
 
-## C.5 Hash chain protocol
+## C.5 `run_start`
 
-- Each event's `prev_hash = SHA256(canonical_json_bytes_of_prev_event)`.
-- First event in episode: `prev_hash = SHA256(run_manifest_json_bytes)`.
-- Episode boundary detected by `episode_summary` event type.
+First event in every run. Anchors the hash chain.
 
-## C.6 NDJSON serialization rules
+```
+event_type            string   "run_start"
+timestamp_ns          int64    0 (run start)
+prev_hash             string   "0000000000000000000000000000000000000000000000000000000000000000" (64 zeros)
+manifest_hash         string   SHA256 hex of canonical run manifest JSON bytes
+schema_version        string   "0.1.0"
+contract_hash         string   body_sha256 of loaded contract
+total_episodes        int      planned episode count
+```
 
-- **Timestamps:** simulated wall-clock — `timestamp_ns = episode_start_ns + step * dt_ns`. No real-time clock dependency. `episode_start_ns` assigned sequentially per episode (e.g., `episode_id * 1e12`).
+## C.6 `kernel_step_summary`
+
+Emitted **every step**, fixed schema. The high-volume "black box flight recorder." Contains only scalar summaries — full vectors go in `safety_intervention` events.
+
+```
+event_type            string   "kernel_step_summary"
+timestamp_ns          int64    int(data.time * 1e9)
+episode_id            string
+step                  int
+prev_hash             string
+contract_state        enum     "ACTIVE" | "DEGRADED" | "REVOKED" | "RTA_STOP"
+l0r_intervened        bool     len(constraints_active) > 0
+l0c_active            bool     L0-C enforcement ran (DEGRADED state)
+l0c_intervened        bool     L0-C actually scaled (scaling_factor < 1.0)
+l0c_scaling_factor    float    1.0 if no scaling
+energy_ratio          float    E_k / E_max from L0-R
+min_margin_to_L0R     float    min across all L0-R constraint margins
+rta_nearmiss          bool     from L0-R
+min_collision_distance float   min across all collision pairs (if computed)
+min_keepout_distance  float    min across all keepout distances (if computed)
+```
+
+## C.7 Hash chain protocol
+
+- The entire run is a **single continuous chain**. Deletion or reordering of events (including across episode boundaries) is detectable.
+- First event in run: `run_start` with `prev_hash = "0"*64` (64-zero sentinel).
+- Every subsequent event: `prev_hash = SHA256(canonical_json_bytes_of_prev_event)`.
+- Episode boundaries are marked by `episode_summary` events within the chain but do **not** break it.
+- Each event's `prev_hash` refers to the immediately preceding event in the NDJSON file, regardless of episode.
+
+## C.8 NDJSON serialization rules
+
+- **Timestamps:** simulated wall-clock — `timestamp_ns = int(data.time * 1e9)`. No real-time clock dependency. Deterministic across runs for identical seeds.
 - **Canonical JSON:** `json.dumps(obj, sort_keys=True, separators=(',', ':'))` — sorted keys, no whitespace. Both `sort_keys` and compact `separators` are required for hash chain reproducibility.
 - **Float quantization:** 6 decimal places for all floating-point values (`round(x, 6)`). Matches 1e-6 quantization. Prevents platform-dependent serialization drift.
 - **Hash input:** the canonical JSON bytes of the event (UTF-8 encoded), **excluding** the trailing newline. `prev_hash = SHA256(canonical_json_bytes_of_prev_event)`.
 - **One event per line**, UTF-8 encoded, newline-terminated (`\n`), no trailing comma.
 
-## C.7 Three-channel serialization
+## C.9 Deterministic event ordering within a step
+
+Within a single step `k`, events are emitted in this fixed order:
+
+1. `shift_injected` — if any shift begins or ends at step `k`
+2. `safety_intervention` layer="L0C" — if L0-C intervened (scaling_factor < 1.0)
+3. `safety_intervention` layer="L0R" — if L0-R intervened (constraints_active non-empty)
+4. `contract_state_change` — if a state transition occurred
+5. `kernel_step_summary` — always (every step)
+
+This ordering makes replay and reasoning deterministic.
+
+## C.10 Three-channel serialization
 
 - `truth`: ground-truth `q`, `qdot`, `tau`, per-keepout TCP-point → box surface signed distances (analytical), per-collision-pair capsule surface distances
 - `observed`: noisy `q`, `qdot`, `tau` (= truth in Gates 0-3, noisy in Gates 4+)
 - `believed`: interval `[q_min_believed, q_max_believed]`, `[qdot_min_believed, qdot_max_believed]` per joint (the eroded state set at decision time)
 
-## C.8 Manifest validation rules
+## C.11 Manifest validation rules
 
 - If `l1_enforcement.arm == "critic"`, only `critic_config` is used; `barrier_qp_config` is ignored (and vice versa).
 - Both config blocks are present in the manifest for schema completeness.
@@ -870,3 +948,11 @@ Determined from geometry — non-adjacent pairs where the arm's kinematics can b
 ## D.10 Control rate
 
 **50 Hz** (dt = 0.02s)
+
+## D.11 MuJoCo substeps (nsubsteps)
+
+**Gates 0-3:** `nsubsteps = 1` (default Euler integration). Known plant tracking gap: MuJoCo integrates gravity, Coriolis, and contact forces within each timestep, causing the realized state to diverge from the kernel's one-step velocity prediction. Per-joint p99 position error ~0.231 rad (231x sensor erosion), velocity error ~11.57 rad/s (1157x sensor erosion). This is a plant fidelity issue, not a safety concern — the kernel re-projects from actual measured state every tick.
+
+**Gates 4+:** `nsubsteps ≥ 10` (configurable in run manifest). With 10 substeps, MuJoCo takes 10 integration steps per control tick, producing a plant that tracks commanded velocities much more closely (resembling a real servo system). This is required for predictive components (L1 critic, barrier certificates) where within-tick prediction accuracy matters.
+
+**Key invariant:** `nsubsteps` changes nothing about the kernel — only the plant accuracy. L0-R projection, monitors, and state machine are independent of `nsubsteps`. The kernel always operates on the actual measured state, not predictions.

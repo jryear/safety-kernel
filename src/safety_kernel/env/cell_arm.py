@@ -2,6 +2,7 @@
 
 Implements Appendix D of the cumulative spec.
 Provides truth/observed channels, mass matrix, FK, keepout distances.
+Gate 1: optional contract integration (state machine, monitors, L0-C enforcement).
 """
 
 from __future__ import annotations
@@ -70,6 +71,8 @@ class CellArmEnv(gym.Env):
         max_steps: int = 500,
         seed: int | None = None,
         enable_l0r: bool = True,
+        contract_path: str | pathlib.Path | None = None,
+        shift_schedule: list | None = None,
     ):
         super().__init__()
         self._model_path = pathlib.Path(model_path) if model_path else _MODEL_PATH
@@ -113,6 +116,34 @@ class CellArmEnv(gym.Env):
         )
         assert self._tcp_site_id >= 0, "TCP site not found in model"
 
+        # ── Gate 1: Contract integration (optional) ──────────────────
+        self._contract = None
+        self._state_machine = None
+        self._monitors = None
+        self._shift_injector = None
+        self._contract_events: list[dict] = []
+        self._keepouts = list(_KEEPOUTS)  # Default: hardcoded
+
+        if contract_path is not None:
+            from safety_kernel.contract.loader import load_contract_file
+            from safety_kernel.contract.monitors import create_monitors
+            from safety_kernel.contract.state_machine import ContractStateMachine
+            from safety_kernel.contract.shift_injector import ShiftInjector
+
+            lc = load_contract_file(pathlib.Path(contract_path))
+            self._contract = lc.contract
+            loop_rate_hz = 1.0 / self.model.opt.timestep
+            self._state_machine = ContractStateMachine(loop_rate_hz)
+            self._monitors = create_monitors(self._contract, loop_rate_hz)
+            self._shift_injector = ShiftInjector(
+                self._contract, shift_schedule,
+            )
+            # Use contract keepouts instead of hardcoded
+            self._keepouts = [
+                (k.name, k.center, k.half_dims)
+                for k in self._contract.keepouts
+            ]
+
     def reset(
         self, *, seed: int | None = None, options: dict | None = None
     ) -> tuple[np.ndarray, dict]:
@@ -128,6 +159,17 @@ class CellArmEnv(gym.Env):
         mujoco.mj_forward(self.model, self.data)
 
         self._step_count = 0
+        self._contract_events = []
+
+        # Per-episode reset of contract components
+        if self._state_machine is not None:
+            self._state_machine.reset_episode()
+        if self._monitors is not None:
+            for m in self._monitors:
+                m.reset_episode()
+        if self._shift_injector is not None:
+            self._shift_injector.reset_episode()
+
         obs = self._get_obs()
         info = self._get_info()
         return obs, info
@@ -137,6 +179,18 @@ class CellArmEnv(gym.Env):
     ) -> tuple[np.ndarray, float, bool, bool, dict]:
         qdot_cmd = np.clip(action, self.action_space.low, self.action_space.high)
 
+        # ── L0-C enforcement (pre-L0-R) ──────────────────────────────
+        l0c_info = None
+        if self._contract is not None and self._state_machine is not None:
+            from safety_kernel.contract.l0c_enforce import l0c_enforce
+            J = self.get_jacobian()
+            qdot_cmd, l0c_info = l0c_enforce(
+                qdot_cmd, J,
+                self._state_machine.state,
+                self._contract.revocation_policy.on_degrade_max_tcp_speed_mps,
+            )
+
+        # ── L0-R projection ──────────────────────────────────────────
         if self._enable_l0r:
             q = self.data.qpos[:self.n_joints].copy()
             M = self._get_mass_matrix()
@@ -167,15 +221,76 @@ class CellArmEnv(gym.Env):
         mujoco.mj_step(self.model, self.data)
 
         self._step_count += 1
+
+        # ── Contract layer: monitors + state machine ─────────────────
+        step_events: list[dict] = []
+        if self._monitors is not None and self._state_machine is not None:
+            step_events = self._evaluate_contract_layer(
+                self._step_count, intervention_info,
+            )
+
         obs = self._get_obs()
         info = self._get_info()
         info["intervention"] = intervention_info
+        if l0c_info is not None:
+            info["l0c"] = l0c_info
+        if step_events:
+            info["contract_events"] = step_events
 
         terminated = False
         truncated = self._step_count >= self._max_steps
         reward = 0.0  # No reward shaping at Gate 0
 
         return obs, reward, terminated, truncated, info
+
+    def _evaluate_contract_layer(
+        self,
+        step: int,
+        intervention_info: dict,
+    ) -> list[dict]:
+        """Evaluate monitors, drive state machine, return events."""
+        from safety_kernel.contract.state_machine import _build_monitors_status
+
+        # Get monitor inputs from shift injector (or perfect baseline)
+        if self._shift_injector is not None:
+            monitor_inputs = self._shift_injector.get_monitor_inputs(step)
+        else:
+            return []
+
+        # Evaluate each monitor
+        monitor_results: dict[str, dict] = {}
+        for m in self._monitors:
+            result = m.evaluate(monitor_inputs)
+            monitor_results[m.name] = {
+                "triggered": result.triggered,
+                "should_trigger": result.should_trigger,
+                "should_clear": result.should_clear,
+                "severity": m.severity,
+                "predicate_violated": result.predicate_violated,
+            }
+
+        # Drive state machine with monitor results
+        events = self._state_machine.process_monitor_events(step, monitor_results)
+
+        # Check for DEGRADED→ACTIVE: set recovery guard with clearing monitor's hysteresis
+        for event in events:
+            if event["from_state"] == "DEGRADED" and event["to_state"] == "ACTIVE":
+                clearing_name = event["trigger_monitor"]
+                for m in self._monitors:
+                    if m.name == clearing_name:
+                        self._state_machine.set_recovery_guard(step, m.hysteresis_ticks)
+                        break
+
+        # L0-R near-miss → RTA_STOP
+        if intervention_info.get("rta_nearmiss", False):
+            monitors_status = _build_monitors_status(monitor_results)
+            nearmiss_events = self._state_machine.notify_l0r_nearmiss(
+                step, monitors_status,
+            )
+            events.extend(nearmiss_events)
+
+        self._contract_events.extend(events)
+        return events
 
     def _get_obs(self) -> np.ndarray:
         """Proprioceptive observation: (q, qdot, tau)."""
@@ -195,7 +310,7 @@ class CellArmEnv(gym.Env):
 
         # Keepout distances (TCP point → box surface)
         keepout_dists = {}
-        for name, center, half_dims in _KEEPOUTS:
+        for name, center, half_dims in self._keepouts:
             keepout_dists[name] = round(
                 _point_to_box_signed_distance(tcp_pos, center, half_dims), 6
             )
@@ -224,11 +339,22 @@ class CellArmEnv(gym.Env):
             "tau": tau.tolist(),
         }
 
-        return {
+        info = {
             "truth": truth,
             "observed": observed,
             "step": self._step_count,
         }
+
+        # Gate 1: contract state + monitor status
+        if self._state_machine is not None:
+            info["contract_state"] = self._state_machine.state.value
+        if self._monitors is not None:
+            info["monitors_status"] = {
+                m.name: {"triggered": m.triggered}
+                for m in self._monitors
+            }
+
+        return info
 
     def _get_mass_matrix(self) -> np.ndarray:
         """Compute and return the full mass matrix M(q)."""

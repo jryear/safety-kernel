@@ -143,7 +143,7 @@ integrity:
     float_quantization: 1.0e-6
     normalize_newlines: true
     unit_normalization: true
-  body_sha256: "TBD_AFTER_CANONICALIZATION"
+  body_sha256: "71f1f71311c1e95f8d56d9d2e8d7abf9ecdcbd02e9f45ce5f1a8746771df76fe"
   signature: null
   signer_id: "integrator:safety_kernel_dev"
   signed_at: null
