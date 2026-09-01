@@ -126,9 +126,9 @@ The advantage is expected to be strongest for geometric/kinematic failures (coll
 | Backward compat | Gate 0 tests pass unchanged with contract integration present | Confirmed | Any contract-mode code path altering no-contract behavior |
 
 **Honestly not yet tested:**
-- Calibration stability (H2) -- no conformal prediction code exists
+- Calibration stability (H2) -- MVP conformal thresholding exists, but no online stability or shift-recovery claim is validated yet
 - Telemetry flywheel integrity (H4) -- no NDJSON logging exists
-- Failure-first transfer advantage (H1/H5) -- no failure critic, no success baseline, no ManiSkill
+- Failure-first transfer advantage (H1/H5) -- MVP failure critic exists, but no success baseline comparison or ManiSkill transfer evidence exists yet
 - Behavior under observation noise (proprioceptive noise injection starts at Gate 4)
 - Multi-fault concurrent injection
 - Plant fidelity with nsubsteps >= 10
@@ -166,6 +166,13 @@ robot/
       errors.py                                      # Error classes
     env/
       cell_arm.py                                    # CellArm 5-DOF Gymnasium env
+    l1/
+      critic.py                                      # Deterministic NumPy failure critic
+      calibration.py                                 # Conformal risk threshold
+      labels.py                                      # Sparse L0-R boundary labels
+      metrics.py                                     # Safety metric aggregation
+      rollouts.py                                    # Deterministic PPO-style rollout adapter
+      ablations.py                                   # Erosion x coverage ablation runner
     telemetry/
       __init__.py                                    # (placeholder, Gate 2)
   tests/
@@ -179,8 +186,10 @@ robot/
     test_l0c_enforce.py                              # TCP speed cap (12 tests)
     test_shift_injector.py                           # Fault injection (20 tests)
     test_gate1_integration.py                        # SLA + integration (14 tests)
+    test_l1_failure_manifold.py                      # L1 critic + ablation smoke tests
   experiments/
     run_manifest_template.yaml                       # Run manifest template
+    run_failure_manifold_ablation.py                 # L1 erosion x coverage ablations
   benchmarks/
     bench_l0r.py                                     # L0-R latency benchmark
   pyproject.toml
@@ -230,6 +239,27 @@ robot/
     - [ ] All prior tests still pass (backward compat)
   - *Expected outcome:* A complete audit trail where every safety decision is logged, hashed, and verifiable. The H3 checker becomes the machine-checkable acceptance test for all subsequent gates.
   - *Spec reference:* Appendix C (C.1-C.11) frozen with event schemas, hash chain protocol, serialization rules, and event ordering.
+
+### Parallel MVP: failure-manifold critic ablations
+
+This track is additive and does not relax Gate 2. It produces the first
+CoRL-facing safety plots around the fresh stack: hard projection, contract
+canonicalization, deterministic shift injection, and learned boundary scores.
+
+```bash
+.venv/bin/python experiments/run_failure_manifold_ablation.py --quick
+.venv/bin/python experiments/run_failure_manifold_ablation.py \
+  --out experiments/results/failure_manifold \
+  --compare-calibration-units
+```
+
+The runner writes `diagnostics.csv`, `metrics.csv`, `summary.json`, and SVG plots for false
+positive rate, false negative rate, empirical unsafe coverage, coverage gap,
+intervention rate, AUC/PR-AUC, and SLA hit rate across erosion scales and
+conformal coverage settings. The CSV also includes per-constraint activation
+rates, component base rates, and intervention severity quantiles so a dead or
+degenerate erosion axis is visible before classifier metrics are interpreted. See
+`docs/failure_manifold_mvp.md` for scope and limitations.
 
 - [ ] **Gate 3: H3 mechanical validation (no L1)**
   - *Pass criteria:*
@@ -341,6 +371,9 @@ pytest tests/test_gate1_integration.py -v   # Gate 1 SLAs + integration
 
 # Run L0-R latency benchmark
 python benchmarks/bench_l0r.py
+
+# Run L1 failure-manifold MVP ablation
+.venv/bin/python experiments/run_failure_manifold_ablation.py --quick
 ```
 
 Requires Python >= 3.10, MuJoCo >= 3.0, NumPy >= 1.26, Gymnasium >= 0.29.
