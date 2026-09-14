@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import pathlib
 
+from safety_kernel.contract.errors import ShiftValidationError
 from safety_kernel.contract.loader import load_contract_file
 from safety_kernel.contract.shift_injector import ShiftInjector, ShiftSpec
 
@@ -254,7 +255,7 @@ class TestSnapshot:
     def test_round_trip(self, contract):
         shifts = [
             ShiftSpec(start_step=10, end_step=50, shift_type="anchor_drift",
-                      params={"anchor": "fid_a", "drift_xyz": [0.1, 0, 0]}),
+                      params={"anchor": contract.anchors[0].name, "drift_xyz": [0.1, 0, 0]}),
         ]
         inj = ShiftInjector(contract, shifts)
         inj.get_monitor_inputs(25)
@@ -272,3 +273,31 @@ class TestReset:
         inj.get_monitor_inputs(50)
         inj.reset_episode()
         assert inj._step_counter == 0
+
+
+class TestShiftValidation:
+    """Invalid shifts must fail before they can silently omit monitor evidence."""
+
+    @pytest.mark.parametrize(
+        "shift",
+        [
+            ShiftSpec(0, None, "anchor_drift", {"anchor": "unknown", "drift_xyz": [0, 0, 0]}),
+            ShiftSpec(0, None, "safety_io_flip", {"signal": "unknown"}),
+            ShiftSpec(0, None, "sensor_stale", {"frame_age_ms": np.inf}),
+            ShiftSpec(0, None, "base_drift", {"drift_xyz": [0, 0]}),
+            ShiftSpec(0, None, "sensor_stale", {"ignored": 1}),
+        ],
+    )
+    def test_rejects_unknown_or_malformed_shift(self, contract, shift):
+        with pytest.raises(ShiftValidationError):
+            ShiftInjector(contract, [shift])
+
+    def test_rejects_nonfinite_shift_for_known_target(self, contract):
+        shift = ShiftSpec(
+            0,
+            None,
+            "anchor_drift",
+            {"anchor": contract.anchors[0].name, "drift_xyz": [np.nan, 0, 0]},
+        )
+        with pytest.raises(ShiftValidationError, match="finite"):
+            ShiftInjector(contract, [shift])

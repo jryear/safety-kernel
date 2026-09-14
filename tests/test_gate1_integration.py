@@ -222,7 +222,7 @@ class TestNoIllegalTransitions:
         shift = ShiftSpec(
             start_step=30, end_step=80,
             shift_type="anchor_drift",
-            params={"anchor": "fid_a", "drift_xyz": [0.05, 0.0, 0.0]},
+            params={"anchor": "fiducial_fixture", "drift_xyz": [0.05, 0.0, 0.0]},
         )
         env = _make_env(shift_schedule=[shift], max_steps=200)
         env.reset(seed=0)
@@ -264,3 +264,173 @@ class TestEpisodeReset:
         # Reset
         env.reset(seed=1)
         assert env._state_machine.state.value == "ACTIVE"
+
+
+class TestAuthorityBoundary:
+    """Contract authority is decided before the current tick moves the plant."""
+
+    _ACTION = np.full(5, 0.5)
+
+    def test_immediate_rta_fault_suppresses_first_nonzero_action(self):
+        shift = ShiftSpec(
+            start_step=0, end_step=None,
+            shift_type="safety_io_flip",
+            params={"signal": "estop_ok"},
+        )
+        env = _make_env(shift_schedule=[shift])
+        env.reset(seed=0)
+
+        _, _, _, _, info = env.step(self._ACTION)
+
+        assert info["contract_state"] == "RTA_STOP"
+        np.testing.assert_array_equal(info["intervention"]["qdot_exec"], np.zeros(5))
+        assert info["l0c"]["l0c_active"] is False
+
+    def test_rta_stop_suppresses_repeated_nonzero_actions(self):
+        shift = ShiftSpec(
+            start_step=0, end_step=None,
+            shift_type="safety_io_flip",
+            params={"signal": "gate_closed"},
+        )
+        env = _make_env(shift_schedule=[shift])
+        env.reset(seed=0)
+
+        infos = [env.step(self._ACTION)[-1] for _ in range(3)]
+
+        assert all(info["contract_state"] == "RTA_STOP" for info in infos)
+        for info in infos:
+            np.testing.assert_array_equal(info["intervention"]["qdot_exec"], np.zeros(5))
+
+    def test_revocation_suppresses_action_on_the_trigger_tick(self):
+        shift = ShiftSpec(
+            start_step=0, end_step=None,
+            shift_type="anchor_drift",
+            params={"anchor": "fiducial_fixture", "drift_xyz": [0.05, 0.0, 0.0]},
+        )
+        env = _make_env(shift_schedule=[shift])
+        env.reset(seed=0)
+
+        _run_steps(env, 13)
+        _, _, _, _, info = env.step(self._ACTION)
+
+        assert info["contract_state"] == "REVOKED"
+        np.testing.assert_array_equal(info["intervention"]["qdot_exec"], np.zeros(5))
+
+    def test_degraded_cap_applies_on_the_trigger_tick(self):
+        shift = ShiftSpec(
+            start_step=0, end_step=None,
+            shift_type="sensor_stale",
+            params={"frame_age_ms": 500.0},
+        )
+        env = _make_env(shift_schedule=[shift])
+        env.reset(seed=0)
+
+        _run_steps(env, 25)
+        action = np.full(5, np.pi)
+        jacobian = env.get_jacobian().copy()
+        assert np.linalg.norm(jacobian @ action) > 0.6
+        _, _, _, _, info = env.step(action)
+
+        assert info["contract_state"] == "DEGRADED"
+        assert info["l0c"]["l0c_active"] is True
+        assert info["l0c"]["tcp_speed_after"] <= 0.6
+        assert "tcp_speed_cap" in info["l0c"]["constraints_active"]
+        assert np.linalg.norm(jacobian @ info["command_trace"]["final_command"]) <= 0.6
+
+    def test_l0r_nearmiss_stops_before_the_plant_step(self):
+        env = _make_env()
+        env.reset(seed=0)
+        env.data.qpos[0] = env.l0r_params.q_max_eroded[0] + 0.1
+
+        _, _, _, _, info = env.step(self._ACTION)
+
+        assert info["contract_state"] == "RTA_STOP"
+        assert info["contract_events"][0]["trigger_monitor"] == "l0r_nearmiss"
+        np.testing.assert_array_equal(info["intervention"]["qdot_exec"], np.zeros(5))
+
+    def test_operator_reset_requires_current_passing_evidence(self):
+        shift = ShiftSpec(
+            start_step=0, end_step=2,
+            shift_type="safety_io_flip",
+            params={"signal": "estop_ok"},
+        )
+        env = _make_env(shift_schedule=[shift])
+        env.reset(seed=0)
+        env.step(self._ACTION)
+        assert env._state_machine.state.value == "RTA_STOP"
+
+        # The original fault is still present at tick 1, so reset is denied.
+        assert env.operator_reset() == []
+        assert env._state_machine.state.value == "RTA_STOP"
+
+        # Tick 1 consumes the denied request in logged evidence.  A fresh
+        # request is evaluated only inside tick 2, after the fault has cleared.
+        env.step(self._ACTION)
+        assert env._state_machine.state.value == "RTA_STOP"
+        assert env.operator_reset() == []
+        events = env.step(self._ACTION)[-1]["contract_events"]
+        assert env._state_machine.state.value == "ACTIVE"
+        assert events[0]["trigger_monitor"] == "operator_reset"
+
+    def test_operator_reset_is_preserved_in_next_decision_evidence(self):
+        shift = ShiftSpec(start_step=0, end_step=2, shift_type="safety_io_flip", params={"signal": "estop_ok"})
+        env = _make_env(shift_schedule=[shift])
+        env.reset(seed=0)
+        env.step(self._ACTION)
+        env.step(self._ACTION)
+        assert env.operator_reset() == []
+        info = env.step(self._ACTION)[-1]
+        authority = info["authority_info"]
+        assert authority["reset_input"] is True
+        assert authority["state_pre"] == "RTA_STOP"
+        assert authority["state_post"] == "ACTIVE"
+        assert info["contract_events"][0]["trigger_monitor"] == "operator_reset"
+
+    def test_missing_monitor_evidence_stops_without_debounce(self):
+        env = _make_env()
+        env.reset(seed=0)
+        env._shift_injector.get_monitor_inputs = lambda step: {}
+
+        _, _, _, _, info = env.step(self._ACTION)
+
+        assert info["contract_state"] == "RTA_STOP"
+        assert info["contract_events"][0]["trigger_monitor"] == "monitor_evidence_missing"
+        np.testing.assert_array_equal(info["intervention"]["qdot_exec"], np.zeros(5))
+
+    @pytest.mark.parametrize("value", [np.nan, np.inf, -np.inf])
+    def test_nonfinite_action_is_rejected(self, value):
+        env = _make_env()
+        env.reset(seed=0)
+        action = self._ACTION.copy()
+        action[0] = value
+
+        with pytest.raises(ValueError, match="finite"):
+            env.step(action)
+
+    def test_command_trace_and_authority_decision_preserve_all_boundaries(self):
+        shift = ShiftSpec(
+            start_step=0, end_step=None,
+            shift_type="safety_io_flip",
+            params={"signal": "estop_ok"},
+        )
+        env = _make_env(shift_schedule=[shift])
+        env.reset(seed=0)
+
+        _, _, _, _, info = env.step(np.full(5, 99.0))
+
+        trace = info["command_trace"]
+        decision = info["authority_decision"]
+        np.testing.assert_array_equal(trace["proposal"], env.action_space.high)
+        # RTA authority suppression is intentionally after L0-C/L0-R so the
+        # evidence retains the actual proposal-to-final veto boundary.
+        np.testing.assert_array_equal(trace["authorized_command"], trace["proposal"])
+        np.testing.assert_array_equal(trace["after_l0c"], trace["proposal"])
+        np.testing.assert_array_equal(trace["final_command"], np.zeros(5))
+        assert decision == {
+            "pre_state": "ACTIVE",
+            "post_state": "RTA_STOP",
+            "authorized": False,
+            "reason": "estop_chain_ok",
+            "proposal": trace["proposal"],
+            "final_command": trace["final_command"],
+        }

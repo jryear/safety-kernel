@@ -201,6 +201,10 @@ class SensorHealthMonitor(Monitor):
             timestamp = sensor.get("timestamp", 0.0)
             if self._prev_timestamp is not None:
                 if timestamp <= self._prev_timestamp:
+                    # A rejected sample is not a new baseline.  Advancing the
+                    # baseline here would let [2.0, 1.0, 1.5] appear to recover
+                    # even though neither later sample exceeds the last known
+                    # good timestamp (2.0).
                     return True
             self._prev_timestamp = timestamp
 

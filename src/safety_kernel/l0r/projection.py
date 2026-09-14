@@ -11,6 +11,7 @@ import numpy as np
 
 from safety_kernel.l0r.params import L0RParams
 from safety_kernel.l0r.capsule import compute_collision_distances_at_q
+from safety_kernel.l0r.errors import L0RSafetyInvariantError
 
 
 def l0r_project(
@@ -36,9 +37,18 @@ def l0r_project(
         safety_intervention NDJSON schema fields.
     """
     n = params.n_joints
-    assert qdot_cmd.shape == (n,)
-    assert q.shape == (n,)
-    assert M.shape == (n, n)
+    if qdot_cmd.shape != (n,):
+        raise ValueError(f"qdot_cmd must have shape ({n},), got {qdot_cmd.shape}")
+    if q.shape != (n,):
+        raise ValueError(f"q must have shape ({n},), got {q.shape}")
+    if M.shape != (n, n):
+        raise ValueError(f"M must have shape ({n}, {n}), got {M.shape}")
+    if not (
+        np.all(np.isfinite(qdot_cmd))
+        and np.all(np.isfinite(q))
+        and np.all(np.isfinite(M))
+    ):
+        raise ValueError("L0-R inputs must be finite")
 
     qdot = qdot_cmd.copy()
     constraints_active: list[str] = []
@@ -113,7 +123,7 @@ def l0r_project(
         pair_name = params.collision_pair_names[idx]
         collision_info.append({
             "pair_id": pair_name,
-            "distance": round(dist, 6),
+            "distance": float(dist),
         })
         if dist < params.d_safe:
             collision_triggered = True
@@ -121,9 +131,21 @@ def l0r_project(
     if collision_triggered:
         qdot[:] = 0.0
         constraints_active.append("self_collision")
+        # Telemetry must describe the final output being checked. The first
+        # distance set explains why the candidate was suppressed; after the
+        # suppression, strict H3 evaluates q_next for the zero command.
+        final_distances = compute_collision_distances_at_q(
+            model, data, q, params.collision_pairs
+        )
+        collision_info = [
+            {"pair_id": params.collision_pair_names[idx], "distance": float(dist)}
+            for idx, dist in enumerate(final_distances)
+        ]
 
-    # ── Debug assertion: verify all constraints on output ───────────
-    _assert_constraints(qdot, q, M, model, data, params)
+    # ── Runtime verification: enforce all output invariants ─────────
+    # This must execute even under ``python -O``; assertions are removed by
+    # the optimizer and cannot be the safety boundary.
+    _verify_output_constraints(qdot, q, M, model, data, params)
 
     # ── Build intervention info ─────────────────────────────────────
     # Compute margins for telemetry
@@ -142,8 +164,8 @@ def l0r_project(
         "qdot_exec": qdot.tolist(),
         "constraints_active": constraints_active,
         "margin_to_L0R": margins,
-        "energy_ratio": round(energy_ratio, 6),
-        "energy_scaling_factor": round(energy_scaling_factor, 6),
+        "energy_ratio": float(energy_ratio),
+        "energy_scaling_factor": float(energy_scaling_factor),
         "collision_pairs": collision_info,
         "rta_nearmiss": rta_nearmiss,
     }
@@ -151,7 +173,7 @@ def l0r_project(
     return qdot, info
 
 
-def _assert_constraints(
+def _verify_output_constraints(
     qdot: np.ndarray,
     q: np.ndarray,
     M: np.ndarray,
@@ -159,12 +181,14 @@ def _assert_constraints(
     data,
     params: L0RParams,
 ) -> None:
-    """Debug assertion: verify qdot_exec satisfies all L0-R constraints.
+    """Verify that the L0-R output satisfies every applicable constraint.
 
     When self-collision zeros velocity and q is already outside eroded
     position bounds, q_next = q still violates position — this is an
     inherent conflict (reported as both self_collision + rta_nearmiss).
-    Position assertions are skipped when velocity is zero from collision.
+    Position verification is skipped only when no finite one-tick recovery
+    command exists because collision handling selected the safer zero command;
+    the caller still receives the RTA near-miss signal.
     """
     EPS = 1e-8
     n = params.n_joints
@@ -174,11 +198,15 @@ def _assert_constraints(
     q_max_e = params.q_max_eroded
     is_zero = not np.any(np.abs(qdot) > EPS)
 
+    if not np.all(np.isfinite(qdot)):
+        raise L0RSafetyInvariantError("L0-R output contains non-finite velocity")
+
     # 1. Velocity limits (always valid — zero satisfies)
     for i in range(n):
-        assert abs(qdot[i]) <= qdot_max_e[i] + EPS, (
-            f"Velocity violation j{i}: |{qdot[i]}| > {qdot_max_e[i]}"
-        )
+        if abs(qdot[i]) > qdot_max_e[i] + EPS:
+            raise L0RSafetyInvariantError(
+                f"Velocity violation j{i}: |{qdot[i]}| > {qdot_max_e[i]}"
+            )
 
     # 2. Position lookahead
     # When q is already outside eroded bounds, max recovery velocity may
@@ -191,26 +219,31 @@ def _assert_constraints(
             if q_outside:
                 # Best-effort recovery: verify velocity moves toward safe region
                 if q[i] < q_min_e[i]:
-                    assert qdot[i] >= -EPS, (
-                        f"Recovery direction j{i}: should move positive but {qdot[i]}"
-                    )
+                    if qdot[i] < -EPS:
+                        raise L0RSafetyInvariantError(
+                            f"Recovery direction j{i}: should move positive but {qdot[i]}"
+                        )
                 else:
-                    assert qdot[i] <= EPS, (
-                        f"Recovery direction j{i}: should move negative but {qdot[i]}"
-                    )
+                    if qdot[i] > EPS:
+                        raise L0RSafetyInvariantError(
+                            f"Recovery direction j{i}: should move negative but {qdot[i]}"
+                        )
             else:
-                assert q_next[i] >= q_min_e[i] - EPS, (
-                    f"Position lower violation j{i}: {q_next[i]} < {q_min_e[i]}"
-                )
-                assert q_next[i] <= q_max_e[i] + EPS, (
-                    f"Position upper violation j{i}: {q_next[i]} > {q_max_e[i]}"
-                )
+                if q_next[i] < q_min_e[i] - EPS:
+                    raise L0RSafetyInvariantError(
+                        f"Position lower violation j{i}: {q_next[i]} < {q_min_e[i]}"
+                    )
+                if q_next[i] > q_max_e[i] + EPS:
+                    raise L0RSafetyInvariantError(
+                        f"Position upper violation j{i}: {q_next[i]} > {q_max_e[i]}"
+                    )
 
     # 3. Energy cap (always valid — zero satisfies)
     e_k = 0.5 * qdot @ M @ qdot
-    assert e_k <= params.e_max_safe + EPS, (
-        f"Energy violation: {e_k} > {params.e_max_safe}"
-    )
+    if e_k > params.e_max_safe + EPS:
+        raise L0RSafetyInvariantError(
+            f"Energy violation: {e_k} > {params.e_max_safe}"
+        )
 
     # 4. Self-collision (only relevant when velocity is non-zero)
     if not is_zero:
@@ -219,7 +252,8 @@ def _assert_constraints(
             model, data, q_next, params.collision_pairs
         )
         for idx, dist in enumerate(distances):
-            assert dist >= params.d_safe - EPS, (
-                f"Self-collision violation {params.collision_pair_names[idx]}: "
-                f"{dist} < {params.d_safe}"
-            )
+            if dist < params.d_safe - EPS:
+                raise L0RSafetyInvariantError(
+                    f"Self-collision violation {params.collision_pair_names[idx]}: "
+                    f"{dist} < {params.d_safe}"
+                )

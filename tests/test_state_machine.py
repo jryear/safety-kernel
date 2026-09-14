@@ -106,6 +106,26 @@ class TestInitialState:
         assert sm.flap_count == 0
 
 
+class TestDeterministicTriggerSelection:
+    """Same-severity simultaneous faults select by monitor name, not map order."""
+
+    def test_equal_severity_uses_lexicographic_monitor_name(self):
+        first = {
+            **_make_revoke_trigger("zeta"),
+            **_make_revoke_trigger("alpha"),
+        }
+        second = {
+            **_make_revoke_trigger("alpha"),
+            **_make_revoke_trigger("zeta"),
+        }
+
+        first_events = ContractStateMachine(LOOP_RATE_HZ).process_monitor_events(0, first)
+        second_events = ContractStateMachine(LOOP_RATE_HZ).process_monitor_events(0, second)
+
+        assert first_events[0]["trigger_monitor"] == "alpha"
+        assert second_events[0]["trigger_monitor"] == "alpha"
+
+
 class TestTransitionTable:
     """Test all 12 rows of the transition table from Section 4.1."""
 

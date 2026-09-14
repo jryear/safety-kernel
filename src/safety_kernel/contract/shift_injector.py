@@ -17,6 +17,7 @@ from typing import Any
 
 import numpy as np
 
+from safety_kernel.contract.errors import ShiftValidationError
 from safety_kernel.contract.schema import Contract
 
 
@@ -46,6 +47,7 @@ class ShiftInjector:
     ):
         self._contract = contract
         self._schedule = list(schedule) if schedule else []
+        self._validate_schedule()
         self._step_counter: int = 0
 
     def reset_episode(self) -> None:
@@ -93,6 +95,107 @@ class ShiftInjector:
         }
 
     # ---- internals ----
+
+    def _validate_schedule(self) -> None:
+        """Reject unrepresentable, ambiguous, or non-finite fault schedules."""
+        anchor_names = {anchor.name for anchor in self._contract.anchors}
+        safety_signals = {
+            monitor.params["signal"]
+            for monitor in self._contract.monitors
+            if monitor.type == "safety_io_health"
+        }
+
+        for shift in self._schedule:
+            if not isinstance(shift, ShiftSpec):
+                raise ShiftValidationError("Shift schedule entries must be ShiftSpec values")
+            if isinstance(shift.start_step, bool) or not isinstance(shift.start_step, int):
+                raise ShiftValidationError("Shift start_step must be a non-negative integer")
+            if shift.start_step < 0:
+                raise ShiftValidationError("Shift start_step must be a non-negative integer")
+            if shift.end_step is not None:
+                if isinstance(shift.end_step, bool) or not isinstance(shift.end_step, int):
+                    raise ShiftValidationError("Shift end_step must be an integer or None")
+                if shift.end_step <= shift.start_step:
+                    raise ShiftValidationError("Shift end_step must be greater than start_step")
+            if not isinstance(shift.params, dict):
+                raise ShiftValidationError("Shift params must be a mapping")
+
+            if shift.shift_type == "anchor_drift":
+                self._require_keys(shift, {"anchor", "drift_xyz"}, {"anchor", "drift_xyz"})
+                if shift.params["anchor"] not in anchor_names:
+                    raise ShiftValidationError(
+                        f"Unknown anchor shift target: {shift.params['anchor']!r}"
+                    )
+                self._require_finite_vector(shift, "drift_xyz")
+            elif shift.shift_type == "safety_io_flip":
+                self._require_keys(shift, {"signal"}, {"signal"})
+                if shift.params["signal"] not in safety_signals:
+                    raise ShiftValidationError(
+                        f"Unknown safety I/O shift target: {shift.params['signal']!r}"
+                    )
+            elif shift.shift_type == "sensor_stale":
+                self._require_keys(
+                    shift,
+                    {"frame_age_ms", "timestamp_override"},
+                    set(),
+                )
+                if not shift.params:
+                    raise ShiftValidationError("sensor_stale requires a frame_age_ms or timestamp_override")
+                if "frame_age_ms" in shift.params:
+                    frame_age_ms = self._require_finite_scalar(shift, "frame_age_ms")
+                    if frame_age_ms < 0.0:
+                        raise ShiftValidationError("sensor_stale frame_age_ms must be non-negative")
+                if "timestamp_override" in shift.params:
+                    self._require_finite_scalar(shift, "timestamp_override")
+            elif shift.shift_type == "base_drift":
+                self._require_keys(shift, {"drift_xyz", "drift_rpy"}, set())
+                if not shift.params:
+                    raise ShiftValidationError("base_drift requires drift_xyz or drift_rpy")
+                for name in ("drift_xyz", "drift_rpy"):
+                    if name in shift.params:
+                        self._require_finite_vector(shift, name)
+            else:
+                raise ShiftValidationError(f"Unknown shift type: {shift.shift_type!r}")
+
+    @staticmethod
+    def _require_keys(
+        shift: ShiftSpec,
+        allowed: set[str],
+        required: set[str],
+    ) -> None:
+        keys = set(shift.params)
+        unknown = keys - allowed
+        missing = required - keys
+        if unknown:
+            raise ShiftValidationError(
+                f"Unsupported {shift.shift_type} parameter(s): {sorted(unknown)!r}"
+            )
+        if missing:
+            raise ShiftValidationError(
+                f"Missing {shift.shift_type} parameter(s): {sorted(missing)!r}"
+            )
+
+    @staticmethod
+    def _require_finite_scalar(shift: ShiftSpec, name: str) -> float:
+        value = shift.params[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float, np.number)):
+            raise ShiftValidationError(f"{shift.shift_type} {name} must be finite numeric")
+        if not np.isfinite(value):
+            raise ShiftValidationError(f"{shift.shift_type} {name} must be finite numeric")
+        return float(value)
+
+    @staticmethod
+    def _require_finite_vector(shift: ShiftSpec, name: str) -> None:
+        try:
+            value = np.asarray(shift.params[name], dtype=np.float64)
+        except (TypeError, ValueError):
+            raise ShiftValidationError(
+                f"{shift.shift_type} {name} must be a finite three-vector"
+            ) from None
+        if value.shape != (3,) or not np.all(np.isfinite(value)):
+            raise ShiftValidationError(
+                f"{shift.shift_type} {name} must be a finite three-vector"
+            )
 
     def _active_shifts(self, step: int) -> list[ShiftSpec]:
         """Filter schedule to shifts active at this step."""

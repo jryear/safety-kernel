@@ -110,37 +110,38 @@ class ContractStateMachine:
         monitors_status = _build_monitors_status(monitor_results)
 
         # Determine highest-priority trigger this step
-        rta_stop_trigger = None
-        revoke_trigger = None
-        degrade_trigger = None
+        rta_stop_triggers: list[str] = []
+        revoke_triggers: list[str] = []
+        degrade_triggers: list[str] = []
         clear_candidates: list[str] = []
 
-        for name, result in monitor_results.items():
+        for name in sorted(monitor_results):
+            result = monitor_results[name]
             severity = result["severity"]
             if result.get("should_trigger"):
                 if severity == SEVERITY_RTA_STOP:
-                    rta_stop_trigger = name
+                    rta_stop_triggers.append(name)
                 elif severity == SEVERITY_REVOKE:
-                    revoke_trigger = name
+                    revoke_triggers.append(name)
                 elif severity == SEVERITY_DEGRADE:
-                    degrade_trigger = name
+                    degrade_triggers.append(name)
             if result.get("should_clear") and severity == SEVERITY_DEGRADE:
                 clear_candidates.append(name)
 
         # Apply in priority order (strict=False: no-op if already in terminal state)
-        if rta_stop_trigger is not None:
+        if rta_stop_triggers:
             self._do_transition(
-                TRIGGER_RTA_STOP, rta_stop_trigger, SEVERITY_RTA_STOP,
+                TRIGGER_RTA_STOP, rta_stop_triggers[0], SEVERITY_RTA_STOP,
                 step, monitors_status, strict=False,
             )
-        elif revoke_trigger is not None:
+        elif revoke_triggers:
             self._do_transition(
-                TRIGGER_REVOKE, revoke_trigger, SEVERITY_REVOKE,
+                TRIGGER_REVOKE, revoke_triggers[0], SEVERITY_REVOKE,
                 step, monitors_status, strict=False,
             )
-        elif degrade_trigger is not None:
+        elif degrade_triggers:
             self._do_transition(
-                TRIGGER_DEGRADE, degrade_trigger, SEVERITY_DEGRADE,
+                TRIGGER_DEGRADE, degrade_triggers[0], SEVERITY_DEGRADE,
                 step, monitors_status, strict=False,
             )
 
@@ -151,7 +152,7 @@ class ContractStateMachine:
             and self._all_degrade_monitors_clear(monitor_results)
         ):
             self._do_transition(
-                TRIGGER_CLEAR, clear_candidates[-1], SEVERITY_CLEAR,
+                TRIGGER_CLEAR, clear_candidates[0], SEVERITY_CLEAR,
                 step, monitors_status,
             )
 

@@ -13,3 +13,6 @@ class ContractValidationError(ContractError):
 class ContractHashMismatchError(ContractError):
     """The contract's integrity hash does not match the canonicalized body."""
 
+
+class ShiftValidationError(ContractValidationError):
+    """A deterministic shift specification is malformed or targets no contract input."""

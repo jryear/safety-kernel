@@ -8,7 +8,7 @@ The unit of operation is **(robot x cell x assumptions)**. One robot, one worksp
 
 ## How we got here
 
-This project started from a practical observation: every major humanoid company (Tesla, Figure, 1X, Boston Dynamics) ships robots with bolted-on safety -- force limits, emergency stops, compliance hardware, human oversight. None have formal guarantees about what happens when assumptions break. As robots move into homes, warehouses, and factories, the question isn't *if* something goes wrong -- it's who certified what, and whether anyone can prove it.
+This project started from a practical observation: every major humanoid company (Tesla, Figure, 1X, Boston Dynamics) ships robots with bolted-on safety -- force limits, emergency stops, compliance hardware, human oversight. Public materials do not establish a physical-stop guarantee when assumptions break. This project therefore records which software commands were suppressed and what evidence supports that claim.
 
 The origin conversation (`Robotics Development Challenges.pdf`) identified three structural problems with success-first robot learning:
 
@@ -56,7 +56,10 @@ ACTIVE ──(degrade)──> DEGRADED ──(revoke)──> REVOKED ──(rta_
   │──(rta_stop)──> RTA_STOP
 ```
 
-Every transition has a logged trigger. Illegal transitions assert-fail. A flap limiter detects rapid oscillation and forces RTA_STOP after 4 A-B-A pairs.
+Every transition has a logged trigger. Illegal transitions raise a typed runtime
+error. Under RFC-0002, a flap is an ACTIVE->DEGRADED re-degradation inside the
+recovery guard established by a prior DEGRADED->ACTIVE transition; at the configured threshold,
+the limiter emits DEGRADED->RTA_STOP on that same tick.
 
 ### Failure-first learning (the thesis)
 
@@ -66,7 +69,7 @@ The advantage is expected to be strongest for geometric/kinematic failures (coll
 
 ### Key technical concepts
 
-- **Minkowski erosion**: L0-R enforces limits tighter than physical limits by a sensor-uncertainty margin. The kernel operates on `q_max_eroded = q_max_physical - (eps_q + eps_qdot * dt)`. This guarantees that even if the true state differs from the observed state by up to the sensor error bound, the physical limits are never violated.
+- **Minkowski erosion**: L0-R enforces limits tighter than physical limits by a sensor-uncertainty margin. The kernel operates on `q_max_eroded = q_max_physical - (eps_q + eps_qdot * dt)`. This is a command-space conservatism claim; physical stopping and plant tracking remain unproven.
 
 - **Sequential projection**: L0-R applies constraints in order (velocity box clamp, position lookahead, energy cap, self-collision check). Each constraint set is star-convex around zero velocity, so scaling toward zero preserves feasibility of all previously satisfied constraints.
 
@@ -80,7 +83,7 @@ The advantage is expected to be strongest for geometric/kinematic failures (coll
 
 ## What exists today
 
-### Implemented and tested (187/187 tests pass)
+### Implemented and tested (Gate 1 baseline; test count is not a certification claim)
 
 **L0-R projection** (`src/safety_kernel/l0r/`)
 - Sequential 4-stage projection: velocity clamp, position lookahead, energy cap, self-collision
@@ -121,13 +124,13 @@ The advantage is expected to be strongest for geometric/kinematic failures (coll
 | Zero L0-R violations | 20,000 steps across 100 episodes, 0 violations | High for tested envelope | Any qdot_exec exceeding eroded limits under adversarial L2 or noisy observations |
 | Detection SLA | 5/5 monitors trigger within spec'd tick budget | High for deterministic injection | SLA miss under sensor noise or concurrent multi-fault injection |
 | No illegal transitions | All observed transitions match 12-row table | High (exhaustive for single-fault) | Concurrent fault + L0-R near-miss producing unlisted transition |
-| No flapping | Limiter fires at threshold (4th pair) | High for mechanism | Hysteresis window too short for real oscillatory fault patterns |
+| No flapping | RFC-0002 limiter fires on the threshold re-degradation inside a recovery guard | High for mechanism | Hysteresis window too short for real oscillatory fault patterns |
 | Determinism | Bitwise identical qdot_exec across 2 runs, same seed | Confirmed | Any platform-dependent floating-point divergence |
 | Backward compat | Gate 0 tests pass unchanged with contract integration present | Confirmed | Any contract-mode code path altering no-contract behavior |
 
 **Honestly not yet tested:**
 - Calibration stability (H2) -- MVP conformal thresholding exists, but no online stability or shift-recovery claim is validated yet
-- Telemetry flywheel integrity (H4) -- no NDJSON logging exists
+- Telemetry flywheel integrity (H4) -- Gate 2 NDJSON telemetry and independent checking now exist; H4 flywheel quality/operations remain unvalidated
 - Failure-first transfer advantage (H1/H5) -- MVP failure critic exists, but no success baseline comparison or ManiSkill transfer evidence exists yet
 - Behavior under observation noise (proprioceptive noise injection starts at Gate 4)
 - Multi-fault concurrent injection
@@ -143,6 +146,7 @@ robot/
     failure_first_safety_kernel_cumulative_spec.md   # Source of truth (all sections)
     rfcs/
       RFC-0001-contract-artifact.md                  # Contract canonicalization RFC
+      RFC-0002-command-authority-and-telemetry.md    # Command claims + telemetry 0.2.0
   contracts/
     cell_arm_track_a.yaml                            # Track A cell contract
     cell_contract_v0.1_example.yaml                  # Template contract
@@ -174,7 +178,7 @@ robot/
       rollouts.py                                    # Deterministic PPO-style rollout adapter
       ablations.py                                   # Erosion x coverage ablation runner
     telemetry/
-      __init__.py                                    # (placeholder, Gate 2)
+      __init__.py                                    # Implemented Gate 2 bundle/schema/adapter/checker/CLI surface
   tests/
     test_l0r_projection.py                           # L0-R unit tests (15 tests)
     test_gate0_acceptance.py                         # Gate 0 smoke + determinism (2 tests)
@@ -209,36 +213,37 @@ robot/
     - [x] Erosion strictly tighter than physical limits
     - [x] L2 intervention rate in 5-20% band (measured: 11.4% at K_p=0.5)
     - [x] P99 per-step latency < 1ms (measured: 0.165ms)
-  - *What this proved:* The projection algorithm is correct for the tested operating envelope. The kernel commands are safe; the plant doesn't perfectly track them (known Euler integration gap), but the kernel re-projects from actual state every tick.
-  - *Known gap carried forward:* Plant tracking gap (~64k diagnostic violations from MuJoCo Euler integration). Not a safety concern -- the kernel is safe because it re-projects, not because it predicts.
+  - *What this evidenced:* The projection algorithm produced constraint-satisfying software commands for the tested operating envelope. Physical stopping and plant realization were not tested to acceptance.
+  - *Known gap carried forward:* Plant tracking gap (~64k diagnostic violations from MuJoCo Euler integration); this remains an unproven physical-safety boundary.
 
 - [x] **Gate 1: L0-C schema + monitors + shift injector**
   - *Pass criteria:*
     - [x] Contract canonicalization produces deterministic hashes (ordering invariance, quantization boundary, number formatting)
     - [x] Contract loader rejects hash mismatch, missing integrity block, wrong schema version
     - [x] All 5 monitors fire within detection SLA (debounce_ticks + 1 steps from first violation)
-    - [x] All state machine transitions match the 12-row transition table; illegal transitions assert-fail
-    - [x] Flap limiter fires after 4th A-B-A pair, forces RTA_STOP
+    - [x] All state machine transitions match the 12-row transition table; illegal transitions fail with a typed runtime error
+    - [x] Flap limiter emits DEGRADED->RTA_STOP on the threshold ACTIVE->DEGRADED re-degradation inside the RFC-0002 recovery guard
     - [x] L0-C TCP speed cap enforces uniform scaling in DEGRADED (monotone, deterministic, pre-L0-R)
     - [x] Shift injector produces correct perfect baseline and applies each shift type deterministically
     - [x] Full backward compatibility: all Gate 0 tests pass unchanged with contract integration present
-    - [x] 187/187 tests pass
+    - [x] Gate 1 test suite passes in the recorded baseline (exact count is not current acceptance evidence)
   - *What this proved:* The contract layer correctly parses, validates, monitors, and revokes. Detection SLAs hold under deterministic single-fault injection. The state machine is legal and the flap limiter is functional.
   - *Known gap carried forward:* All testing under perfect observations. No sensor noise, no multi-fault combinations, no real perception stack.
 
-- [ ] **Gate 2: NDJSON telemetry + H3 checker**
+- [x] **Gate 2: NDJSON telemetry + H3 checker** *(architecturally approved; Gate 3 remains closed)*
   - *Pass criteria:*
-    - [ ] Event serialization is byte-deterministic (same seed, same run produces identical NDJSON)
-    - [ ] Hash chain is continuous across the entire run (no per-episode breaks)
-    - [ ] `run_start` event anchors chain with prev_hash = 64 zeros
-    - [ ] `kernel_step_summary` emitted every step with fixed schema
-    - [ ] `safety_intervention` emitted only on actual modification, with `layer` field ("L0C"/"L0R")
-    - [ ] Deterministic event ordering within each step: shift_injected, L0C intervention, L0R intervention, contract_state_change, kernel_step_summary
-    - [ ] H3 checker predicates (a-d) run as offline NDJSON log analysis and produce pass/fail
-    - [ ] Replay from NDJSON: rehydrate state from logged events and confirm consistency
-    - [ ] All prior tests still pass (backward compat)
-  - *Expected outcome:* A complete audit trail where every safety decision is logged, hashed, and verifiable. The H3 checker becomes the machine-checkable acceptance test for all subsequent gates.
-  - *Spec reference:* Appendix C (C.1-C.11) frozen with event schemas, hash chain protocol, serialization rules, and event ordering.
+    - [x] Event serialization is byte-deterministic (same seed, same run produces identical NDJSON)
+    - [x] Hash chain is continuous across the entire run (no per-episode breaks)
+    - [x] `run_start` event anchors chain with prev_hash = 64 zeros
+    - [x] `kernel_step_summary` emitted every step with fixed schema
+    - [x] `safety_intervention` emitted only on actual modification, with `layer` field ("L0C"/"L0R"/"RTA")
+    - [x] Deterministic causal ordering within each step: shift, decision evidence, L0C, L0R, RTA, state change, summary
+    - [x] Gate 2 evidence bundle, independent checker, and structural replay received fresh architectural approval (H3 mechanical acceptance is Gate 3)
+    - [x] Replay from NDJSON rehydrates states, ordering, and counts
+    - [x] All prior tests still pass (backward compat)
+  - *Expected outcome:* A complete, hash-verifiable evidence bundle for command suppression. This does not prove physical stopping or H3 mechanical correctness.
+  - *Spec reference:* RFC-0002 and Appendix C (C.1-C.11), frozen with nine event types (including decision_evidence), continuous producer hash chain, exact float.hex values, complete-bundle rules, and structural replay.
+  - *Accepted Gate 2 evidence:* two independent 100-episode x 200-step productions emitted byte-identical 63,897-event NDJSON (`0f6c6892...1ab4bef`). Evidence integrity passed and every H3 predicate was computable; detection SLA, transition, flap, and degraded-cap predicates passed. Strict H3 reported 7,667 L0-R findings and therefore remains unaccepted for Gate 3. See `docs/gate2-acceptance-checkpoint.md`.
 
 ### Parallel MVP: failure-manifold critic ablations
 
@@ -263,13 +268,13 @@ degenerate erosion axis is visible before classifier metrics are interpreted. Se
 
 - [ ] **Gate 3: H3 mechanical validation (no L1)**
   - *Pass criteria:*
-    - [ ] H3(a): Zero L0-R violations across a full Track A run (target: 500+ episodes)
+    - [ ] H3(a): Zero L0-R violations across a full Track A run (target: 500+ episodes; no recovery exemptions)
     - [ ] H3(b): 100% detection SLA compliance verified by H3 checker against NDJSON logs
     - [ ] H3(c): Zero illegal transitions in logged events
     - [ ] H3(d): No flapping beyond threshold (N=4) per episode
     - [ ] All four predicates checked by the H3 offline checker (not just unit tests)
     - [ ] Run manifest records exact configuration: seed, contract hash, env config hash
-  - *Expected outcome:* Mechanical correctness is proven at scale with full telemetry. This is the hard checkpoint: if H3 fails here, everything after it is blocked. No L1 involvement -- this validates the floor that L1 builds on.
+  - *Expected outcome:* Strict H3 mechanical evidence is evaluated at scale with full telemetry. This remains a hard checkpoint and makes no physical-stopping claim.
   - *What it means if it fails:* Either L0-R projection has an edge case, or the monitor/state-machine has a bug exposed by scale. Both are findable and fixable.
 
 - [ ] **Gate 4: Conformal calibration loop + cold-start protocol**
@@ -281,7 +286,7 @@ degenerate erosion axis is visible before classifier metrics are interpreted. Se
     - [ ] Plant fidelity criterion: with nsubsteps >= 10, per-joint p99 tracking errors < eps_q (position) and < eps_qdot (velocity)
     - [ ] L1 logs risk scores but does NOT filter actions during warmup (tau_0 = +inf)
     - [ ] Epsilon sweep across near-violation label distances (percentile-based per constraint type)
-  - *Expected outcome:* The conformal loop converges and produces a meaningful threshold under noisy observations. This is the first gate where learned components exist. Cold-start is safe because L0-R + L0-C + RTA enforce safety while L1 warms up.
+  - *Expected outcome:* The conformal loop converges and produces a meaningful threshold under noisy observations. This is the first gate where learned components exist; cold-start command suppression remains limited to the specified software layers.
   - *What it means if it fails:* Calibration doesn't converge within budget -- either not enough boundary events in 200 episodes, or the noise injection creates too much variance for conformal bounds to tighten.
 
 - [ ] **Gate 5: Calibration under shift (H2)**
@@ -396,7 +401,7 @@ Requires Python >= 3.10, MuJoCo >= 3.0, NumPy >= 1.26, Gymnasium >= 0.29.
 1. **Single robot, single cell.** Multi-contract composition is deferred.
 2. **Proprioceptive only.** No vision. Vision adds a fundamentally different uncertainty profile.
 3. **CPU simulation only.** M-series Mac, no GPU. Vision/large ensembles require rented GPU.
-4. **Plant fidelity gap (Gates 0-3).** MuJoCo Euler integration at 50Hz overshoots physical limits. The kernel is safe because it re-projects from actual state, not because it predicts. Fixed at Gate 4+ with nsubsteps >= 10.
+4. **Plant fidelity gap (Gates 0-3).** MuJoCo Euler integration at 50Hz overshoots physical limits. This is a diagnostic limitation, not evidence of physical stopping. Re-measurement with nsubsteps >= 10 is planned at Gate 4+.
 5. **Success baseline strength.** H1 depends on comparing against the strongest reasonable success policy under the same compute budget. A weak baseline makes the result uninterpretable.
 6. **Contact-dynamics uncertainty.** Failure-first advantage is a higher-variance bet for contact-rich manipulation than for geometric-only scenarios. The experimental pipeline measures this distinction rather than assuming it away.
 
@@ -406,6 +411,7 @@ Requires Python >= 3.10, MuJoCo >= 3.0, NumPy >= 1.26, Gymnasium >= 0.29.
 
 - `docs/failure_first_safety_kernel_cumulative_spec.md` -- Complete specification (sections 0-10, appendices A-D)
 - `docs/rfcs/RFC-0001-contract-artifact.md` -- Contract canonicalization protocol
+- `docs/rfcs/RFC-0002-command-authority-and-telemetry.md` -- Command authority boundary and telemetry 0.2.0
 - `docs/co-architect-primer.md` -- Epistemic protocol for co-architect agents (required for ABI/safety/gate decisions)
 - `1x_safety_kernel_onepager.md` -- Commercial framing and motivation
 - `Robotics Development Challenges.pdf` -- Origin conversation

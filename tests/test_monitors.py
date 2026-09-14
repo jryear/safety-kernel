@@ -316,6 +316,13 @@ class TestSensorHealth:
         result = m.evaluate({"sensor_health": {"frame_age_ms": 10.0, "timestamp": 50.0}})
         assert result.predicate_violated
 
+    def test_rollback_does_not_replace_last_good_timestamp(self):
+        m = self._make_monitor()
+        assert not m.evaluate({"sensor_health": {"frame_age_ms": 10.0, "timestamp": 2.0}}).predicate_violated
+        assert m.evaluate({"sensor_health": {"frame_age_ms": 10.0, "timestamp": 1.0}}).predicate_violated
+        assert m.evaluate({"sensor_health": {"frame_age_ms": 10.0, "timestamp": 1.5}}).predicate_violated
+        assert not m.evaluate({"sensor_health": {"frame_age_ms": 10.0, "timestamp": 2.1}}).predicate_violated
+
     def test_reset_clears_timestamp(self):
         m = self._make_monitor()
         m.evaluate({"sensor_health": {"frame_age_ms": 10.0, "timestamp": 100.0}})

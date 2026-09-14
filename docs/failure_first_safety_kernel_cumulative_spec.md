@@ -1,13 +1,17 @@
 # Failure‑First Safety Kernel for Robot Deployments
 **Unit of operation:** *(robot × cell × assumptions)*  
 **Date:** 2026‑02‑06  
-**Status:** Cumulative spec (pre‑implementation; gates defined through Track B)
+**Status:** Cumulative spec (accepted specification; implementation stopped at Gate 2)
+
+**Authority boundary:** The kernel may suppress, replace, or scale a proposed
+software command. Physical stopping, contact-force safety, plant tracking, and
+deployment certification are unproven. L0-C geometry is diagnostic evidence only.
 
 ---
 
 ## 0. Objective
 
-Prove in simulation that a **failure‑first** safety architecture is:
+Evaluate in simulation whether a **failure‑first** safety architecture is:
 
 1. **Mechanically correct** — L0‑R is never violated; L0‑C revocation is deterministic; the contract state machine is legal.
 2. **Calibration‑stable under shift** — conformal thresholds adapt; the false‑negative (FN) rate recovers within bounded time.
@@ -50,7 +54,10 @@ Prove in simulation that a **failure‑first** safety architecture is:
 **Predictive shield guard (compile-time):**
 - `ENABLE_PREDICTIVE_SHIELD = false` until Gate 6 calibration governance is online
 - Predictive shields (barrier certificates, CBF-QP) are diagnostic-only while this flag is false
-- Rationale: integration error between kernel prediction and plant realization is not additive state uncertainty — treating it as such (Path 2) contaminates erosion budgets. The kernel is safe because it re-projects from actual state every tick. Predictive enforcement requires calibrated error models (Gate 6+).
+- Rationale: integration error between kernel prediction and plant realization is
+  not additive state uncertainty. Re-projection is a command-space design choice,
+  not evidence of physical stopping. Predictive enforcement requires calibrated
+  error models (Gate 6+).
 
 #### 2.1.1 L0-R Projection Algorithm (CellArm)
 
@@ -71,15 +78,25 @@ Prove in simulation that a **failure‑first** safety architecture is:
 
 **Ordering rationale:** All constraints define sets that are star-convex around `qdot = 0`. Scaling toward zero preserves feasibility of all previously satisfied constraints. Order goes cheapest/most-independent to most-expensive/most-coupled.
 
-**Infeasibility handling:** Handled within step 2 (see above). If any joint is outside eroded bounds at entry, the projection still produces a valid output (recovery velocity) but flags RTA near-miss in the intervention telemetry.
+**Infeasibility handling:** Handled within step 2 (see above). If any joint is
+outside eroded bounds at entry, the projection records an RTA near-miss. A
+recovery command never exempts the event from strict H3 evaluation.
 
-**Output verification (debug assertion):** After step 4, assert that `qdot_exec` satisfies all four constraints. This is a debug-mode assertion, not a runtime cost in production.
+**Output verification (runtime):** After step 4, executable checks validate
+finite output, eroded velocity, applicable one-tick position, energy, and
+nonzero-command collision invariants. These checks remain active under
+`python -O` and raise a typed safety-invariant error. Strict H3 separately has
+no zero-command or recovery exemption.
 
 **Timing budget:** ~600 ns worst case for 5-DOF (well under 1ms target).
 
 ---
 
 ### 2.2 L0‑C — Certified cell intrinsics (integrator‑certified, revocable)
+
+L0-C geometry and distance calculations are diagnostic evidence only. L0-C may
+suppress a software command (for example, a configured TCP speed cap); this is
+not proof of physical containment or stopping.
 **What it is:**
 - a **contract artifact** describing static geometry + anchors + monitors + revocation policy
 - canonical YAML → deterministic hash → optional signature → runtime verification
@@ -113,6 +130,9 @@ Prove in simulation that a **failure‑first** safety architecture is:
 - Input: sensor telemetry metadata (timestamp, frame age)
 - Predicate: `frame_age > max_frame_age_ms OR !monotonic_timestamps OR checksum_mismatch`
 - In simulation: inject staleness via shift injector
+- Conservative timestamp rule: a stale or nonmonotonic sample does not advance
+  the stored last-good timestamp; recovery requires a later timestamp than the
+  last accepted one.
 
 **robot_mount_integrity:**
 - Input: estimated base transform vs. contract-specified base pose
@@ -281,7 +301,11 @@ Illegal transitions **assert‑fail** in validation.
 
 ### 4.3 Flapping definition
 
-A state machine **flap** is a pair of transitions A→B→A within the hysteresis window. Max `N=4` flaps per episode means max 4 such pairs. After the 4th, force transition to RTA_STOP.
+A state-machine **flap** is an `ACTIVE→DEGRADED` re-degradation within the
+configured guard `[recovery_step,recovery_step+hysteresis_ticks)` established
+by the preceding `DEGRADED→ACTIVE` recovery (inclusive/exclusive). The limiter
+emits `DEGRADED→RTA_STOP` at the same step as the threshold re-degradation;
+outside-window re-degradations are not flaps.
 
 ---
 
@@ -349,17 +373,18 @@ All must hold:
 - (c) **No illegal state transitions**; every transition must have a logged trigger
 - (d) **No flapping** beyond configured threshold (default N=4 per episode)
 
-#### 8.1 H3 checker predicates (machine-checkable)
+#### 8.1 H3 checker predicates (machine-checkable; no recovery exemptions)
 
 **(a) Zero L0-R violations (kernel output check):**
 - Predicate: for every step in every episode, `qdot_exec` satisfies all L0-R constraints:
   - `|qdot_exec[i]| ≤ qdot_max_eroded[i]` (velocity limits after erosion)
   - `q[i] + qdot_exec[i] * dt ∈ [q_min_eroded, q_max_eroded]` (position lookahead)
   - `0.5 * qdot_exec^T * M(q) * qdot_exec ≤ E_max_safe` (energy cap)
-  - self-collision distance at predicted `q_next` ≥ d_safe (or qdot_exec == 0)
+  - self-collision distance at predicted `q_next` ≥ d_safe
 - Tolerance: floating-point ε = 1e-8 (smaller than sensor erosion by orders of magnitude)
-- This checks **kernel outputs** (`qdot_exec`), not plant realized state — the kernel is responsible for what it commands, not for MuJoCo integration drift
-- **Plant tracking diagnostic** (logged, not a gate blocker): additionally log `truth.q`, `truth.qdot`, `truth.E_k` violations as a diagnostic metric quantifying plant-integrator gap. Non-zero values are expected and informative but do not fail the gate.
+- This checks **kernel outputs** (`qdot_exec`) and telemetry integrity. A recovery
+  command or diagnostic flag never waives a violation. Physical stopping and
+  plant realization remain unproven diagnostics, not acceptance claims.
 
 **(a.gate4) Plant fidelity criterion (Gate 4+ only):**
 - With `nsubsteps ≥ 10` active (see Appendix D.11), per-joint p99 tracking errors must fall below the within-tick margin budget:
@@ -384,8 +409,10 @@ All must hold:
 - Checked by scanning all `contract_state_change` events in the NDJSON log
 
 **(d) No flapping:**
-- Predicate: count state machine flaps (A→B→A pairs within hysteresis window) per episode ≤ N (default 4)
-- If exceeded, the episode must end in RTA_STOP (the flap limiter fires)
+- Predicate: count ACTIVE→DEGRADED re-degradations within the prior recovery
+  guard per episode ≤ N (default 4).
+- At the threshold, the same decision tick must emit DEGRADED→RTA_STOP (the
+  flap limiter fires); no completed-pair or exceeded allowance exists.
 
 ### H2 (calibration stability)
 - **cold‑start:** calibration reaches warmth (see Section 2.3 warmup detection criteria) within `n_warmup_episodes`; this is a configured bound, not unbounded
@@ -431,13 +458,11 @@ CBFs, conformal prediction, ensemble uncertainty, and safe RL all exist as indep
 
 No single component is novel in isolation. The claim is that the composition produces a system with properties none of the individual techniques achieve alone.
 
-### 10.2 Competitive landscape (as of 2026‑02)
-- **Figure AI** — Created safety and reliability teams in 2025; no published safety architecture.
-- **Tesla Optimus** — FSD‑derived neural networks with force limiting and "localized safety chip." Success‑first architecture.
-- **1X NEO** — Most safety‑conscious hardware design (tendon‑driven compliance, soft exterior, human‑in‑the‑loop). Passive hardware + human oversight, not learned safety.
-- **Boston Dynamics** — Long history of robust control; no published formal safety kernel with learned failure critics or contract state machines.
+### 10.2 Competitive landscape
 
-**No major humanoid robotics company is publishing formal safety kernels, contract state machines, or failure‑first learning.** The architecture is positioned against a landscape where formal safety guarantees are underweighted relative to demonstration capability.
+Competitive and novelty claims are out of scope for acceptance and are not safety
+evidence. Any future comparison must cite current primary sources and remain
+explicitly provisional.
 
 ### 10.3 Thesis scope
 The failure‑first transfer advantage (H1) is a **strong claim for geometric/kinematic failures** — collision, joint limits, energy bounds — where the failure manifold is lower‑dimensional, physics‑stable, and well‑modeled in simulation.
@@ -681,7 +706,7 @@ logging:
 
 # Appendix C — NDJSON Event Schemas (full field definitions)
 
-Seven event types, one per line in the NDJSON log. All events share the `prev_hash` chain for integrity. Every event carries `event_type` as the first field for dispatch.
+Nine event types, one per line in the NDJSON log: `run_start`, `episode_start`, `shift_injected`, `decision_evidence`, `safety_intervention`, `contract_state_change`, `kernel_step_summary`, `episode_summary`, and `run_end`. Checker reports are separate bundle artifacts and never part of the producer hash chain. All producer events share one continuous `prev_hash` chain. `event_type` is the first serialized field; unknown types and fields fail closed.
 
 ## C.1 `safety_intervention`
 
@@ -692,7 +717,7 @@ event_type            string   "safety_intervention"
 timestamp_ns          int64    simulated wall-clock: int(data.time * 1e9)
 episode_id            string
 step                  int
-layer                 enum     "L0R" | "L0C" | "L1"
+layer                 enum     "L0R" | "L0C" | "RTA" (L1 reserved and rejected in 0.2.0)
 prev_hash             string   SHA256 hex of previous event's canonical JSON bytes
 qdot_cmd              float[5] input to this layer (L2 output for L0C, L0C output for L0R)
 qdot_exec             float[5] output of this layer
@@ -709,6 +734,12 @@ truth                 object   {q: float[5], qdot: float[5], tau: float[5],
 observed              object   {q: float[5], qdot: float[5], tau: float[5]}
 believed              object   {q_interval: float[5][2], qdot_interval: float[5][2]}
 ```
+
+Every floating value above is serialized twice: a six-decimal display string at
+its schema location and an exact canonical `float.hex` value in the event's
+`float_hex` map under that location's JSON pointer. Only the `float_hex` value is
+authoritative. The mapping must be bijective; missing, orphaned, non-canonical,
+or inconsistent entries fail closed.
 
 **layer_info for L0C:**
 ```
@@ -756,8 +787,9 @@ seed                  int
 contract_hash         string
 prev_hash             string
 total_steps           int
-total_interventions   dict     per-layer count: {"L0R": int, "L0C": int, "L1": int}
+total_interventions   dict     per-layer count: {"L0R": int, "L0C": int, "L1": int, "RTA": int}
 state_transitions     list[{step: int, from: string, to: string, trigger: string}]
+state_transition_count int    exact length of state_transitions
 final_state           enum     "ACTIVE" | "DEGRADED" | "REVOKED" | "RTA_STOP"
 synthetic_revocation  bool
 synthetic_revocation_params  object | null  {trigger_step, duration_steps, injected_monitor}
@@ -779,9 +811,11 @@ event_type            string   "run_start"
 timestamp_ns          int64    0 (run start)
 prev_hash             string   "0000000000000000000000000000000000000000000000000000000000000000" (64 zeros)
 manifest_hash         string   SHA256 hex of canonical run manifest JSON bytes
-schema_version        string   "0.1.0"
+schema_version        string   "0.2.0"
 contract_hash         string   body_sha256 of loaded contract
+environment_hash      string   SHA256 of canonical environment evidence
 total_episodes        int      planned episode count
+command_authority     string   "software_command_suppression_only"
 ```
 
 ## C.6 `kernel_step_summary`
@@ -799,12 +833,29 @@ l0r_intervened        bool     len(constraints_active) > 0
 l0c_active            bool     L0-C enforcement ran (DEGRADED state)
 l0c_intervened        bool     L0-C actually scaled (scaling_factor < 1.0)
 l0c_scaling_factor    float    1.0 if no scaling
+l0c_cap_evidence      object|null  exact TCP speed after and configured cap
 energy_ratio          float    E_k / E_max from L0-R
 min_margin_to_L0R     float    min across all L0-R constraint margins
 rta_nearmiss          bool     from L0-R
 min_collision_distance float   min across all collision pairs (if computed)
 min_keepout_distance  float    min across all keepout distances (if computed)
+l0r_evidence          object|null  exact q, executed command, eroded limits,
+                                    dt, mass matrix, energy limit, collision limit/distances
 ```
+
+## C.6a Remaining 0.2.0 event schemas
+
+`episode_start` carries `event_type`, `timestamp_ns`, `episode_id`, `seed`,
+`contract_hash`, `planned_steps`, `prev_hash`, and `float_hex`.
+`decision_evidence` carries `event_type`, `timestamp_ns`, `episode_id`, `step`,
+`proposal`, `l0c_command`, `l0r_command`, `final_command`, pre-step `truth`,
+`observed`, and `believed` channels, `monitor_inputs`, `monitor_results`,
+`authority_state_pre`, `authority_state_post`, `authorized`, `authority_reason`,
+`reset_input`, `rta_nearmiss`, `prev_hash`, and `float_hex`.
+`run_end` carries `event_type`, `timestamp_ns`, `status`, `command_authority`,
+`actual_event_count`, `actual_episode_count`, `last_event_hash`, `prev_hash`, and
+`float_hex`, but never a checker verdict. These fields are required; unknown
+fields are rejected.
 
 ## C.7 Hash chain protocol
 
@@ -813,12 +864,17 @@ min_keepout_distance  float    min across all keepout distances (if computed)
 - Every subsequent event: `prev_hash = SHA256(canonical_json_bytes_of_prev_event)`.
 - Episode boundaries are marked by `episode_summary` events within the chain but do **not** break it.
 - Each event's `prev_hash` refers to the immediately preceding event in the NDJSON file, regardless of episode.
+- Episode CRC32 is computed over the exact newline-terminated bytes from
+  `episode_start` through the last step event, excluding `episode_summary`.
 
 ## C.8 NDJSON serialization rules
 
 - **Timestamps:** simulated wall-clock — `timestamp_ns = int(data.time * 1e9)`. No real-time clock dependency. Deterministic across runs for identical seeds.
-- **Canonical JSON:** `json.dumps(obj, sort_keys=True, separators=(',', ':'))` — sorted keys, no whitespace. Both `sort_keys` and compact `separators` are required for hash chain reproducibility.
-- **Float quantization:** 6 decimal places for all floating-point values (`round(x, 6)`). Matches 1e-6 quantization. Prevents platform-dependent serialization drift.
+- **Canonical JSON:** compact UTF-8 JSON with `event_type` first, followed by
+  all other keys in lexicographic order.
+- **Float encoding:** each floating value is a six-decimal display string plus
+  an exact canonical `float.hex` value in the event-level `float_hex` map.
+  Decisions use only the exact mapping; both representations are hashed.
 - **Hash input:** the canonical JSON bytes of the event (UTF-8 encoded), **excluding** the trailing newline. `prev_hash = SHA256(canonical_json_bytes_of_prev_event)`.
 - **One event per line**, UTF-8 encoded, newline-terminated (`\n`), no trailing comma.
 
@@ -827,16 +883,26 @@ min_keepout_distance  float    min across all keepout distances (if computed)
 Within a single step `k`, events are emitted in this fixed order:
 
 1. `shift_injected` — if any shift begins or ends at step `k`
-2. `safety_intervention` layer="L0C" — if L0-C intervened (scaling_factor < 1.0)
-3. `safety_intervention` layer="L0R" — if L0-R intervened (constraints_active non-empty)
-4. `contract_state_change` — if a state transition occurred
-5. `kernel_step_summary` — always (every step)
+2. `decision_evidence` — always, preserving the proposal, intermediate
+   commands, final command, pre-step evidence, and authority decision
+3. `safety_intervention` layer="L0C" — if L0-C modified the command
+4. `safety_intervention` layer="L0R" — if L0-R modified the command
+5. `safety_intervention` layer="RTA" — if authority suppression modified the command
+6. `contract_state_change` — if a state transition occurred
+7. `kernel_step_summary` — always (every step)
 
 This ordering makes replay and reasoning deterministic.
 
+`episode_start` precedes the first step, `episode_summary` follows the last, and
+`run_end` is last. A complete finalized bundle includes `manifest.json`,
+`contract.json`, `environment.json`, `events.ndjson`, `checker.json`, and
+`completion_receipt.json`. Missing evidence is not an empty result and fails
+closed. The receipt binds the producer components and checker without entering
+the producer hash chain.
+
 ## C.10 Three-channel serialization
 
-- `truth`: ground-truth `q`, `qdot`, `tau`, per-keepout TCP-point → box surface signed distances (analytical), per-collision-pair capsule surface distances
+- `truth`: ground-truth `q`, `qdot`, `tau`, `tcp_pos`, per-keepout TCP-point → box surface signed distances (analytical), per-collision-pair capsule surface distances
 - `observed`: noisy `q`, `qdot`, `tau` (= truth in Gates 0-3, noisy in Gates 4+)
 - `believed`: interval `[q_min_believed, q_max_believed]`, `[qdot_min_believed, qdot_max_believed]` per joint (the eroded state set at decision time)
 
@@ -951,7 +1017,7 @@ Determined from geometry — non-adjacent pairs where the arm's kinematics can b
 
 ## D.11 MuJoCo substeps (nsubsteps)
 
-**Gates 0-3:** `nsubsteps = 1` (default Euler integration). Known plant tracking gap: MuJoCo integrates gravity, Coriolis, and contact forces within each timestep, causing the realized state to diverge from the kernel's one-step velocity prediction. Per-joint p99 position error ~0.231 rad (231x sensor erosion), velocity error ~11.57 rad/s (1157x sensor erosion). This is a plant fidelity issue, not a safety concern — the kernel re-projects from actual measured state every tick.
+**Gates 0-3:** `nsubsteps = 1` (default Euler integration). Known plant tracking gap: MuJoCo integrates gravity, Coriolis, and contact forces within each timestep, causing the realized state to diverge from the kernel's one-step velocity prediction. Per-joint p99 position error ~0.231 rad (231x sensor erosion), velocity error ~11.57 rad/s (1157x sensor erosion). This remains an unresolved physical-safety boundary; re-projection establishes only the next software command decision.
 
 **Gates 4+:** `nsubsteps ≥ 10` (configurable in run manifest). With 10 substeps, MuJoCo takes 10 integration steps per control tick, producing a plant that tracks commanded velocities much more closely (resembling a real servo system). This is required for predictive components (L1 critic, barrier certificates) where within-tick prediction accuracy matters.
 

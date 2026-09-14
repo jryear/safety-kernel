@@ -12,6 +12,12 @@ Tests from the plan:
 9. Determinism — same input → identical output across 1000 runs (bitwise)
 """
 
+import os
+import pathlib
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import mujoco
 import pytest
@@ -403,6 +409,53 @@ def test_determinism(env, params):
                                           model, data, params)
         np.testing.assert_array_equal(qdot_out, qdot_ref)
         assert info_out["energy_scaling_factor"] == info_ref["energy_scaling_factor"]
+
+
+def test_output_invariant_check_runs_under_python_optimized_mode():
+    """L0-R output verification must not disappear under ``python -O``."""
+    code = textwrap.dedent(
+        """
+        from types import SimpleNamespace
+        import numpy as np
+
+        from safety_kernel.l0r.errors import L0RSafetyInvariantError
+        from safety_kernel.l0r.projection import _verify_output_constraints
+
+        params = SimpleNamespace(
+            n_joints=1,
+            dt=0.02,
+            qdot_max_eroded=np.array([1.0]),
+            q_min_eroded=np.array([-2.0]),
+            q_max_eroded=np.array([2.0]),
+            e_max_safe=10.0,
+            d_safe=0.02,
+            collision_pairs=[],
+            collision_pair_names=[],
+        )
+        try:
+            _verify_output_constraints(
+                np.array([2.0]), np.array([0.0]), np.eye(1), None, None, params
+            )
+        except L0RSafetyInvariantError:
+            raise SystemExit(0)
+        raise SystemExit("unsafe output was accepted under python -O")
+        """
+    )
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    env = os.environ | {
+        "PYTHONPATH": str(repo_root / "src")
+        + os.pathsep
+        + os.environ.get("PYTHONPATH", ""),
+    }
+    result = subprocess.run(
+        [sys.executable, "-O", "-c", code],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
 
 
 # ──────────────────────────────────────────────────────────────────
